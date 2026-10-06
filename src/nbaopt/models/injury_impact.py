@@ -9,9 +9,6 @@ Calculates:
   - Which players absorb the usage
 """
 
-import pandas as pd
-from typing import Optional
-
 
 def estimate_usage_redistribution(
     player_name: str,
@@ -25,11 +22,7 @@ def estimate_usage_redistribution(
 
     Returns a dict of player_name → score_boost.
     """
-    active = {
-        name: data
-        for name, data in roster_scores.items()
-        if name != player_name and data["status"] == "ACTIVE"
-    }
+    active = {name: data for name, data in roster_scores.items() if name != player_name and data["status"] == "ACTIVE"}
 
     total_active_score = sum(d["predicted_score"] for d in active.values())
     if total_active_score == 0:

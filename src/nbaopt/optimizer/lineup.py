@@ -8,9 +8,9 @@ Positional logic:
   - Respects injury status (OUT players excluded)
 """
 
-import pandas as pd
 from itertools import combinations
-from typing import Optional
+
+import pandas as pd
 
 STANDARD_POSITIONS = ["PG", "SG", "SF", "PF", "C"]
 
@@ -62,20 +62,19 @@ def build_player_pool(
     return pd.DataFrame(rows)
 
 
-def greedy_positional_lineup(pool: pd.DataFrame) -> Optional[pd.DataFrame]:
+def greedy_positional_lineup(pool: pd.DataFrame) -> pd.DataFrame | None:
     """
     Greedy approach: fill each position slot with the highest-scoring
     eligible player who hasn't already been assigned.
     """
-    assigned = set()
+    assigned: set[str] = set()
     lineup = []
 
     pool_sorted = pool.sort_values("predicted_score", ascending=False)
 
     for pos in STANDARD_POSITIONS:
         eligible = pool_sorted[
-            pool_sorted["positions"].apply(lambda p: pos in p)
-            & ~pool_sorted["name"].isin(assigned)
+            pool_sorted["positions"].apply(lambda p, pos=pos: pos in p) & ~pool_sorted["name"].isin(assigned)
         ]
         if eligible.empty:
             # fallback: any unassigned player
@@ -92,7 +91,7 @@ def greedy_positional_lineup(pool: pd.DataFrame) -> Optional[pd.DataFrame]:
     return pd.DataFrame(lineup)
 
 
-def brute_force_best_five(pool: pd.DataFrame) -> Optional[pd.DataFrame]:
+def brute_force_best_five(pool: pd.DataFrame) -> pd.DataFrame | None:
     """
     Exhaustive search for the highest total projected score
     from any combination of 5 players (no positional constraint).
@@ -101,11 +100,12 @@ def brute_force_best_five(pool: pd.DataFrame) -> Optional[pd.DataFrame]:
     if len(pool) < 5:
         return None
 
-    best_score = -1
-    best_combo = None
+    scores = [float(x) for x in pool["predicted_score"]]
+    best_score = -1.0
+    best_combo: tuple[int, ...] | None = None
 
-    for combo in combinations(pool.itertuples(index=False), 5):
-        total = sum(p.predicted_score for p in combo)
+    for combo in combinations(range(len(pool)), 5):
+        total = sum(scores[i] for i in combo)
         if total > best_score:
             best_score = total
             best_combo = combo
@@ -113,8 +113,7 @@ def brute_force_best_five(pool: pd.DataFrame) -> Optional[pd.DataFrame]:
     if not best_combo:
         return None
 
-    rows = [c._asdict() for c in best_combo]
-    df = pd.DataFrame(rows)
+    df = pool.iloc[list(best_combo)].reset_index(drop=True)
     df["slot"] = STANDARD_POSITIONS[: len(df)]
     return df
 
@@ -137,11 +136,7 @@ def optimize_lineup(
     """
     pool = build_player_pool(roster_df, roster_scores)
 
-    excluded = [
-        name
-        for name, data in roster_scores.items()
-        if data.get("status") != "ACTIVE"
-    ]
+    excluded = [name for name, data in roster_scores.items() if data.get("status") != "ACTIVE"]
 
     if len(pool) < 5:
         return {

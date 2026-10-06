@@ -13,23 +13,24 @@ Drop-in replacement for the statistical predictor.py — predict_player_score()
 signature is identical.
 """
 
-import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
+
+from nbaopt.config import model_path, normalizer_path
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 LEAGUE_AVG_DEF_RATING = 113.5
-MIN_GAMES_FOR_MODEL   = 5      # fall back to rolling avg below this
-SEQ_LEN               = 10     # games fed into LSTM
-MODEL_PATH            = os.path.join(os.path.dirname(__file__), "lstm_weights.pt")
+MIN_GAMES_FOR_MODEL = 5  # fall back to rolling avg below this
+SEQ_LEN = 10  # games fed into LSTM
 
 # Raw stat columns pulled from nba_api game log
-STAT_COLS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "MIN",
-             "FG_PCT", "FG3_PCT", "FT_PCT", "PLUS_MINUS"]
+STAT_COLS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "MIN", "FG_PCT", "FG3_PCT", "FT_PCT", "PLUS_MINUS"]
 
 # Fantasy scoring weights (used for labels during training & baseline fallback)
 SCORE_WEIGHTS = {
@@ -41,13 +42,14 @@ SCORE_WEIGHTS = {
     "TOV": -1.0,
 }
 
-INPUT_SIZE  = len(STAT_COLS) + 1   # stats + opponent DEF_RATING
+INPUT_SIZE = len(STAT_COLS) + 1  # stats + opponent DEF_RATING
 HIDDEN_SIZE = 64
-NUM_LAYERS  = 2
-DROPOUT     = 0.2
+NUM_LAYERS = 2
+DROPOUT = 0.2
 
 
 # ── Fantasy score helper (used for labels + fallback) ─────────────────────────
+
 
 def compute_fantasy_score(row: pd.Series) -> float:
     score = sum(row.get(s, 0) * w for s, w in SCORE_WEIGHTS.items())
@@ -55,6 +57,7 @@ def compute_fantasy_score(row: pd.Series) -> float:
 
 
 # ── LSTM Model ────────────────────────────────────────────────────────────────
+
 
 class PlayerLSTM(nn.Module):
     """
@@ -67,10 +70,10 @@ class PlayerLSTM(nn.Module):
 
     def __init__(
         self,
-        input_size:  int = INPUT_SIZE,
+        input_size: int = INPUT_SIZE,
         hidden_size: int = HIDDEN_SIZE,
-        num_layers:  int = NUM_LAYERS,
-        dropout:     float = DROPOUT,
+        num_layers: int = NUM_LAYERS,
+        dropout: float = DROPOUT,
     ):
         super().__init__()
         self.lstm = nn.LSTM(
@@ -89,13 +92,14 @@ class PlayerLSTM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, seq_len, input_size)
-        lstm_out, _ = self.lstm(x)          # (batch, seq_len, hidden)
-        last_hidden  = lstm_out[:, -1, :]   # take final timestep
-        dropped      = self.dropout(last_hidden)
+        lstm_out, _ = self.lstm(x)  # (batch, seq_len, hidden)
+        last_hidden = lstm_out[:, -1, :]  # take final timestep
+        dropped = self.dropout(last_hidden)
         return self.head(dropped).squeeze(-1)  # (batch,)
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
+
 
 class GameSequenceDataset(Dataset):
     """
@@ -141,6 +145,7 @@ class GameSequenceDataset(Dataset):
 
 # ── Normalization ─────────────────────────────────────────────────────────────
 
+
 class FeatureNormalizer:
     """
     Per-feature mean/std normalizer.
@@ -150,11 +155,11 @@ class FeatureNormalizer:
 
     def __init__(self):
         self.mean_: np.ndarray | None = None
-        self.std_:  np.ndarray | None = None
+        self.std_: np.ndarray | None = None
 
     def fit(self, X: np.ndarray):
         self.mean_ = X.mean(axis=0)
-        self.std_  = X.std(axis=0) + 1e-8
+        self.std_ = X.std(axis=0) + 1e-8
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         return (X - self.mean_) / self.std_
@@ -164,6 +169,8 @@ class FeatureNormalizer:
         return self.transform(X)
 
     def save(self, path: str):
+        if self.mean_ is None or self.std_ is None:
+            raise ValueError("FeatureNormalizer must be fit before saving")
         np.savez(path, mean=self.mean_, std=self.std_)
 
     @classmethod
@@ -171,20 +178,21 @@ class FeatureNormalizer:
         data = np.load(path)
         n = cls()
         n.mean_ = data["mean"]
-        n.std_  = data["std"]
+        n.std_ = data["std"]
         return n
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
+
 def train_model(
     game_logs_df: pd.DataFrame,
-    epochs:      int   = 30,
-    lr:          float = 1e-3,
-    batch_size:  int   = 32,
-    seq_len:     int   = SEQ_LEN,
-    save_path:   str   = MODEL_PATH,
-    verbose:     bool  = True,
+    epochs: int = 30,
+    lr: float = 1e-3,
+    batch_size: int = 32,
+    seq_len: int = SEQ_LEN,
+    save_path: str | Path | None = None,
+    verbose: bool = True,
 ) -> tuple["PlayerLSTM", "FeatureNormalizer"]:
     """
     Train the LSTM on a historical game-log DataFrame.
@@ -194,7 +202,7 @@ def train_model(
     Multiple players' logs can be concatenated together for a shared model.
 
     Saves:
-      save_path           — model weights (.pt)
+      save_path           — model weights (.pt), default config.model_path()
       save_path.norm.npz  — normalizer stats
 
     Returns (model, normalizer).
@@ -230,12 +238,10 @@ def train_model(
 
     dataset = GameSequenceDataset(df, seq_len=seq_len)
     if len(dataset) == 0:
-        raise ValueError(
-            f"Not enough rows to build sequences. Need > {seq_len} games, got {len(df)}."
-        )
+        raise ValueError(f"Not enough rows to build sequences. Need > {seq_len} games, got {len(df)}.")
 
-    loader    = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    model     = PlayerLSTM()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    model = PlayerLSTM()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
@@ -246,7 +252,7 @@ def train_model(
         for X_batch, y_batch in loader:
             optimizer.zero_grad()
             preds = model(X_batch)
-            loss  = criterion(preds, y_batch)
+            loss = criterion(preds, y_batch)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -257,26 +263,30 @@ def train_model(
             avg_loss = epoch_loss / len(loader)
             print(f"  Epoch {epoch:>3}/{epochs}  MSE Loss: {avg_loss:.4f}")
 
-    torch.save(model.state_dict(), save_path)
-    normalizer.save(save_path + ".norm.npz")
+    weights_path = Path(save_path) if save_path else model_path()
+    weights_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), weights_path)
+    normalizer.save(str(normalizer_path(weights_path)))
     if verbose:
-        print(f"\n  Model saved  → {save_path}")
-        print(f"  Normalizer   → {save_path}.norm.npz")
+        print(f"\n  Model saved  → {weights_path}")
+        print(f"  Normalizer   → {normalizer_path(weights_path)}")
 
     return model, normalizer
 
 
 # ── Inference helpers ─────────────────────────────────────────────────────────
 
+
 def _load_model_and_normalizer() -> tuple["PlayerLSTM | None", "FeatureNormalizer | None"]:
     """Load saved weights + normalizer. Returns (None, None) if files not found."""
-    norm_path = MODEL_PATH + ".norm.npz"
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(norm_path):
+    weights_path = model_path()
+    norm_path = normalizer_path(weights_path)
+    if not weights_path.exists() or not norm_path.exists():
         return None, None
     model = PlayerLSTM()
-    model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu", weights_only=True))
+    model.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
     model.eval()
-    normalizer = FeatureNormalizer.load(norm_path)
+    normalizer = FeatureNormalizer.load(str(norm_path))
     return model, normalizer
 
 
@@ -300,7 +310,7 @@ def _build_inference_sequence(
 
     values = df[feature_cols].values[-seq_len:].astype(np.float32)
     if len(values) < seq_len:
-        pad    = np.zeros((seq_len - len(values), len(feature_cols)), dtype=np.float32)
+        pad = np.zeros((seq_len - len(values), len(feature_cols)), dtype=np.float32)
         values = np.vstack([pad, values])
 
     return values
@@ -327,12 +337,11 @@ def _rolling_avg_predict(
     Statistical fallback: rolling averages + opponent DEF_RATING scaling.
     Used when the trained model is not available or data is insufficient.
     """
-    stat_cols = [c for c in ["PTS", "REB", "AST", "STL", "BLK", "TOV", "MIN"]
-                 if c in game_log.columns]
-    numeric   = game_log[stat_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
-    avgs      = pd.Series(numeric.mean().to_dict())
-    base      = compute_fantasy_score(avgs)
-    ratio     = float(np.clip(opponent_def_rating / LEAGUE_AVG_DEF_RATING, 0.85, 1.15))
+    stat_cols = [c for c in ["PTS", "REB", "AST", "STL", "BLK", "TOV", "MIN"] if c in game_log.columns]
+    numeric = game_log[stat_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    avgs = pd.Series(numeric.mean().to_dict())
+    base = compute_fantasy_score(avgs)
+    ratio = float(np.clip(opponent_def_rating / LEAGUE_AVG_DEF_RATING, 0.85, 1.15))
     return round(base * ratio, 2)
 
 
@@ -346,9 +355,9 @@ def _minutes_penalty(score: float, avg_minutes: float) -> float:
 # ── Module-level model cache ──────────────────────────────────────────────────
 # Loaded once on first call, reused for all subsequent players in the same run.
 
-_MODEL:        "PlayerLSTM | None"        = None
-_NORMALIZER:   "FeatureNormalizer | None" = None
-_MODEL_LOADED: bool                        = False
+_MODEL: "PlayerLSTM | None" = None
+_NORMALIZER: "FeatureNormalizer | None" = None
+_MODEL_LOADED: bool = False
 
 
 def _ensure_model_loaded():
@@ -359,6 +368,7 @@ def _ensure_model_loaded():
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
 
 def predict_player_score(
     game_log: pd.DataFrame,
@@ -403,59 +413,52 @@ def predict_player_score(
     if injured:
         return {
             "predicted_score": 0.0,
-            "base_score":       0.0,
-            "model_used":       "n/a",
-            "status":           "OUT",
-            "avg_minutes":      0,
-            "games_sampled":    0,
-            "rolling_stats":    {},
+            "base_score": 0.0,
+            "model_used": "n/a",
+            "status": "OUT",
+            "avg_minutes": 0,
+            "games_sampled": 0,
+            "rolling_stats": {},
         }
 
     # ── No data ───────────────────────────────────────────────────────────────
     if game_log is None or game_log.empty:
         return {
             "predicted_score": 0.0,
-            "base_score":       0.0,
-            "model_used":       "n/a",
-            "status":           "NO_DATA",
-            "avg_minutes":      0,
-            "games_sampled":    0,
-            "rolling_stats":    {},
+            "base_score": 0.0,
+            "model_used": "n/a",
+            "status": "NO_DATA",
+            "avg_minutes": 0,
+            "games_sampled": 0,
+            "rolling_stats": {},
         }
 
     # ── Rolling stats (always computed — used for CLI display + fallback) ─────
-    display_cols = [c for c in ["PTS", "REB", "AST", "STL", "BLK", "TOV", "MIN"]
-                    if c in game_log.columns]
-    numeric  = game_log[display_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
-    avgs     = numeric.mean().to_dict()
-    avg_min  = float(avgs.get("MIN", 0))
-    n_games  = len(game_log)
+    display_cols = [c for c in ["PTS", "REB", "AST", "STL", "BLK", "TOV", "MIN"] if c in game_log.columns]
+    numeric = game_log[display_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    avgs = numeric.mean().to_dict()
+    avg_min = float(avgs.get("MIN", 0))
+    n_games = len(game_log)
 
     # ── Choose prediction method ──────────────────────────────────────────────
     _ensure_model_loaded()
 
-    use_lstm = (
-        n_games >= MIN_GAMES_FOR_MODEL
-        and _MODEL is not None
-        and _NORMALIZER is not None
-    )
-
-    if use_lstm:
-        sequence   = _build_inference_sequence(game_log, opponent_def_rating)
+    if n_games >= MIN_GAMES_FOR_MODEL and _MODEL is not None and _NORMALIZER is not None:
+        sequence = _build_inference_sequence(game_log, opponent_def_rating)
         base_score = _lstm_predict(_MODEL, _NORMALIZER, sequence)
-        method     = "lstm"
+        method = "lstm"
     else:
         base_score = _rolling_avg_predict(game_log, opponent_def_rating)
-        method     = "rolling_avg_fallback"
+        method = "rolling_avg_fallback"
 
     final_score = _minutes_penalty(base_score, avg_min)
 
     return {
         "predicted_score": final_score,
-        "base_score":       base_score,
-        "model_used":       method,
-        "status":           "ACTIVE",
-        "avg_minutes":      round(avg_min, 1),
-        "games_sampled":    n_games,
-        "rolling_stats":    {k: round(v, 2) for k, v in avgs.items()},
+        "base_score": base_score,
+        "model_used": method,
+        "status": "ACTIVE",
+        "avg_minutes": round(avg_min, 1),
+        "games_sampled": n_games,
+        "rolling_stats": {k: round(v, 2) for k, v in avgs.items()},
     }

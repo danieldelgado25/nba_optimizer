@@ -3,18 +3,19 @@ fetcher.py
 Pulls player stats and injury data from nba_api.
 """
 
-from nba_api.stats.endpoints import (
-    playergamelog,
-    commonteamroster,
-    leaguedashteamstats,
-    leaguedashplayerstats,
-    scoreboardv2,
-)
-from nba_api.stats.static import teams as nba_teams_static, players as nba_players_static
-import pandas as pd
 import time
 
-CURRENT_SEASON = "2024-25"
+import pandas as pd
+from nba_api.stats.endpoints import (
+    commonteamroster,
+    leaguedashplayerstats,
+    leaguedashteamstats,
+    playergamelog,
+    scoreboardv2,
+)
+from nba_api.stats.static import teams as nba_teams_static
+
+from nbaopt.config import current_season
 
 
 def get_team_id(team_name: str) -> int | None:
@@ -31,47 +32,62 @@ def get_team_id(team_name: str) -> int | None:
     return None
 
 
-def get_team_roster(team_id: int) -> pd.DataFrame:
+def get_team_roster(team_id: int, season: str | None = None) -> pd.DataFrame:
     """Return current roster for a team."""
     time.sleep(0.6)
-    roster = commonteamroster.CommonTeamRoster(team_id=team_id, season=CURRENT_SEASON)
+    roster = commonteamroster.CommonTeamRoster(team_id=team_id, season=season or current_season())
     df = roster.get_data_frames()[0]
     return df[["PLAYER_ID", "PLAYER", "NUM", "POSITION"]]
 
 
-def get_player_game_log(player_id: int, last_n: int = 10) -> pd.DataFrame:
+def get_player_game_log(player_id: int, last_n: int = 10, season: str | None = None) -> pd.DataFrame:
     """Return last N games for a player."""
     time.sleep(0.6)
     log = playergamelog.PlayerGameLog(
         player_id=player_id,
-        season=CURRENT_SEASON,
+        season=season or current_season(),
         season_type_all_star="Regular Season",
     )
     df = log.get_data_frames()[0]
     if df.empty:
         return df
-    cols = ["GAME_DATE", "MATCHUP", "WL", "MIN", "PTS", "REB", "AST", "STL", "BLK", "TOV", "FG_PCT", "FG3_PCT", "FT_PCT", "PLUS_MINUS"]
+    cols = [
+        "GAME_DATE",
+        "MATCHUP",
+        "WL",
+        "MIN",
+        "PTS",
+        "REB",
+        "AST",
+        "STL",
+        "BLK",
+        "TOV",
+        "FG_PCT",
+        "FG3_PCT",
+        "FT_PCT",
+        "PLUS_MINUS",
+    ]
     df = df[cols].head(last_n)
     df["MIN"] = pd.to_numeric(df["MIN"], errors="coerce").fillna(0)
     return df
 
 
-def get_league_player_stats() -> pd.DataFrame:
+def get_league_player_stats(season: str | None = None) -> pd.DataFrame:
     """Season averages for all players."""
     time.sleep(0.6)
     stats = leaguedashplayerstats.LeagueDashPlayerStats(
-        season=CURRENT_SEASON,
+        season=season or current_season(),
         per_mode_simple="PerGame",
     )
     df = stats.get_data_frames()[0]
     return df
 
 
-def get_team_defensive_rating() -> pd.DataFrame:
+def get_team_defensive_rating(season: str | None = None) -> pd.DataFrame:
     """Opponent points allowed per 100 possessions for every team."""
     time.sleep(0.6)
     stats = leaguedashteamstats.LeagueDashTeamStats(
-        season=CURRENT_SEASON,
+        season=season or current_season(),
         measure_type_simple="Advanced",
         per_mode_simple="PerGame",
     )
