@@ -169,6 +169,8 @@ class FeatureNormalizer:
         return self.transform(X)
 
     def save(self, path: str):
+        if self.mean_ is None or self.std_ is None:
+            raise ValueError("FeatureNormalizer must be fit before saving")
         np.savez(path, mean=self.mean_, std=self.std_)
 
     @classmethod
