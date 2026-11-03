@@ -2,51 +2,62 @@
 train.py
 Builds and saves the LSTM model weights used by predictor.py.
 
-Fetches historical game logs for every player on a given team (or a list
-of player IDs), trains the LSTM, and writes:
-  models/lstm_weights.pt
-  models/lstm_weights.pt.norm.npz
+Fetches a season of game logs for every player on the given teams (default:
+all 30, last completed season), trains the LSTM, evaluates it against the
+rolling-average baseline on held-out games, and writes:
+  artifacts/lstm_weights.pt
+  artifacts/lstm_weights.pt.norm.npz
+  artifacts/lstm_weights.pt.metrics.json
 
 Usage
 -----
-# Train on one team's current roster
-nbaopt train --team "Boston Celtics"
+# All 30 teams, last completed season (default)
+nbaopt train
 
-# Train on multiple teams for a larger, more generalizable model
-nbaopt train --team "Boston Celtics" --team "Los Angeles Lakers" --team "Denver Nuggets"
-
-# Control training hyperparameters
-nbaopt train --team "Celtics" --epochs 50 --games 82 --lr 0.0005
+# Specific teams / season / hyperparameters
+nbaopt train --team "Boston Celtics" --team "Denver Nuggets"
+nbaopt train --season 2024-25 --epochs 10 --lr 0.0005
 """
 
 import argparse
 from collections.abc import Sequence
+from pathlib import Path
 
 import pandas as pd
+from nba_api.stats.static import teams as nba_teams_static
 
-from nbaopt.data.fetcher import get_player_game_log, get_team_defensive_rating, get_team_id, get_team_roster
-from nbaopt.models.predictor import train_model
+from nbaopt.config import previous_season
+from nbaopt.data.fetcher import (
+    def_rating_by_abbr,
+    get_player_game_log,
+    get_team_defensive_rating,
+    get_team_id,
+    get_team_roster,
+    opponent_abbr,
+)
+from nbaopt.models.predictor import LEAGUE_AVG_DEF_RATING, train_model
 
 
 def fetch_training_data(
     team_names: list[str],
-    games_per_player: int = 40,
+    games_per_player: int = 82,
     season: str | None = None,
 ) -> pd.DataFrame:
     """
-    Pull game logs for all players on the given teams.
-    Attempts to attach opponent DEF_RATING to each game row.
+    Pull game logs for all players on the given teams for one season.
+    Attaches each game's opponent DEF_RATING (parsed from MATCHUP).
     Returns a concatenated DataFrame ready for train_model().
     """
-    print("\nFetching defensive ratings for all teams...")
+    season = season or previous_season()
+    print(f"\nFetching {season} defensive ratings for all teams...")
     try:
-        def_df = get_team_defensive_rating(season=season)
-        def_rating_map = dict(zip(def_df["TEAM_ID"], def_df["DEF_RATING"], strict=True))  # noqa: F841 (unused until P2)
+        rating_map = def_rating_by_abbr(get_team_defensive_rating(season=season))
     except Exception as e:
         print(f"  Warning: could not fetch DEF ratings ({e}), using league avg.")
-        def_rating_map = {}  # noqa: F841
+        rating_map = {}
 
     all_logs = []
+    seen_ids = set()  # players traded mid-season can appear on two rosters
 
     for team_name in team_names:
         team_id = get_team_id(team_name)
@@ -64,34 +75,17 @@ def fetch_training_data(
         for i, (_, player) in enumerate(roster.iterrows(), 1):
             name = player["PLAYER"]
             pid = player["PLAYER_ID"]
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
             print(f"  [{i:>2}/{len(roster)}] {name} ...", end="\r")
 
             try:
                 log = get_player_game_log(pid, last_n=games_per_player, season=season)
                 if log.empty:
                     continue
-
-                # Try to attach opponent DEF_RATING from the MATCHUP column
-                # nba_api MATCHUP format: "BOS vs. MIA" or "BOS @ MIA"
-                # We approximate by assigning a fixed team avg for now;
-                # a more precise approach requires parsing matchup strings.
-                log["OPP_DEF_RATING"] = 113.5  # league avg fallback
-
-                # Compute fantasy score label
-                for col in ["PTS", "REB", "AST", "STL", "BLK", "TOV"]:
-                    if col in log.columns:
-                        log[col] = pd.to_numeric(log[col], errors="coerce").fillna(0)
-                log["FANTASY_SCORE"] = (
-                    log.get("PTS", 0) * 1.0
-                    + log.get("REB", 0) * 1.2
-                    + log.get("AST", 0) * 1.5
-                    + log.get("STL", 0) * 3.0
-                    + log.get("BLK", 0) * 3.0
-                    + log.get("TOV", 0) * -1.0
-                )
-
-                # Reverse so oldest game is first (LSTM needs chronological order)
-                log = log.iloc[::-1].reset_index(drop=True)
+                log["PLAYER_ID"] = pid
+                log["OPP_DEF_RATING"] = opponent_abbr(log["MATCHUP"]).map(rating_map).fillna(LEAGUE_AVG_DEF_RATING)
                 all_logs.append(log)
 
             except Exception as e:
@@ -110,9 +104,9 @@ def fetch_training_data(
 
 TRAIN_EXAMPLES = """
 Examples:
-  nbaopt train --team "Boston Celtics"
-  nbaopt train --team "Celtics" --team "Lakers" --team "Warriors" --epochs 50
-  nbaopt train --team "Celtics" --games 82 --lr 0.0005 --batch-size 64
+  nbaopt train
+  nbaopt train --team "Celtics" --team "Lakers" --team "Warriors"
+  nbaopt train --season 2024-25 --games 82 --lr 0.0005 --batch-size 64
 """
 
 
@@ -123,14 +117,18 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> None:
         "--team",
         action="append",
         dest="teams",
-        required=True,
-        help="Team name(s) to pull training data from (can pass multiple times).",
+        default=None,
+        help="Team name(s) to pull training data from (can pass multiple times). Default: all 30.",
     )
-    parser.add_argument("--epochs", type=int, default=30, help="Training epochs (default: 30)")
+    # 6: held-out MAE bottoms out around epoch 5 on 2025-26 data, then overfits
+    parser.add_argument("--epochs", type=int, default=6, help="Training epochs (default: 6)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (default: 0.001)")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size (default: 32)")
-    parser.add_argument("--games", type=int, default=40, help="Games per player to fetch (default: 40)")
-    parser.add_argument("--season", default=None, help="Season like '2025-26' (default: current season)")
+    parser.add_argument("--games", type=int, default=82, help="Games per player to fetch (default: 82)")
+    parser.add_argument(
+        "--val-frac", type=float, default=0.2, help="Last fraction of each player's games held out (default: 0.2)"
+    )
+    parser.add_argument("--season", default=None, help="Season like '2025-26' (default: last completed season)")
     parser.add_argument(
         "--model-path",
         default=None,
@@ -139,16 +137,28 @@ def add_train_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run_training(args: argparse.Namespace) -> None:
+    season = args.season or previous_season()
+    teams = args.teams or [t["full_name"] for t in nba_teams_static.get_teams()]
+
     print("=" * 62)
     print("  NBA LSTM Predictor — Training")
     print("=" * 62)
-    print(f"\n  Teams   : {', '.join(args.teams)}")
+    print(f"\n  Season  : {season}")
+    print(f"  Teams   : {'all 30' if not args.teams else ', '.join(teams)}")
     print(f"  Epochs  : {args.epochs}")
     print(f"  LR      : {args.lr}")
     print(f"  Batch   : {args.batch_size}")
     print(f"  Games   : {args.games} per player")
 
-    df = fetch_training_data(args.teams, games_per_player=args.games, season=args.season)
+    # ponytail: cache key ignores --team/--games; delete the file to refetch
+    cache = Path.cwd() / "data" / f"train_{season}.csv"
+    if cache.exists():
+        print(f"\n  Using cached game logs: {cache}")
+        df = pd.read_csv(cache)
+    else:
+        df = fetch_training_data(teams, games_per_player=args.games, season=season)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(cache, index=False)
 
     print("\n" + "=" * 62)
     print("  Training LSTM...")
@@ -159,6 +169,7 @@ def run_training(args: argparse.Namespace) -> None:
         epochs=args.epochs,
         lr=args.lr,
         batch_size=args.batch_size,
+        val_frac=args.val_frac,
         save_path=args.model_path,
         verbose=True,
     )

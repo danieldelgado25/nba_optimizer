@@ -10,7 +10,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-    "nba_api>=1.4.1",
+    "nba_api>=1.12.0",  # LeagueDashTeamStats measure_type_detailed_defense
     "pandas>=2.0.0",
     "numpy>=1.24.0",
     "torch>=2.0.0",

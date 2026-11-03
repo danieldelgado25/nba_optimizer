@@ -3,12 +3,12 @@ lineup.py
 Selects the optimal 5-man lineup from a roster using predicted scores.
 
 Positional logic:
-  - Tries to fill: PG, SG, SF, PF, C (standard 5)
-  - Falls back to best-5-by-score if positional data is incomplete
+  - Fills PG, SG, SF, PF, C (standard 5) with the highest-total eligible players
+  - Falls back to best-5-by-score if no positionally valid lineup exists
   - Respects injury status (OUT players excluded)
 """
 
-from itertools import combinations
+from itertools import combinations, permutations
 
 import pandas as pd
 
@@ -17,7 +17,7 @@ STANDARD_POSITIONS = ["PG", "SG", "SF", "PF", "C"]
 
 def parse_positions(position_str: str) -> list[str]:
     """Parse position strings like 'PG-SG' or 'F' into a list."""
-    if not position_str:
+    if not isinstance(position_str, str) or not position_str:  # NaN from CSV-loaded rosters
         return []
     # Normalize common abbreviations
     pos = position_str.upper().replace(" ", "")
@@ -62,33 +62,22 @@ def build_player_pool(
     return pd.DataFrame(rows)
 
 
-def greedy_positional_lineup(pool: pd.DataFrame) -> pd.DataFrame | None:
+def best_positional_lineup(pool: pd.DataFrame) -> pd.DataFrame | None:
     """
-    Greedy approach: fill each position slot with the highest-scoring
-    eligible player who hasn't already been assigned.
+    Exact search: the highest-total 5 players that can fill PG/SG/SF/PF/C
+    with every slot held by a position-eligible player.
+
+    Combos are tried best-total first, so the first feasible one is optimal.
     """
-    assigned: set[str] = set()
-    lineup = []
-
-    pool_sorted = pool.sort_values("predicted_score", ascending=False)
-
-    for pos in STANDARD_POSITIONS:
-        eligible = pool_sorted[
-            pool_sorted["positions"].apply(lambda p, pos=pos: pos in p) & ~pool_sorted["name"].isin(assigned)
-        ]
-        if eligible.empty:
-            # fallback: any unassigned player
-            remaining = pool_sorted[~pool_sorted["name"].isin(assigned)]
-            if remaining.empty:
-                return None
-            best = remaining.iloc[0]
-        else:
-            best = eligible.iloc[0]
-
-        assigned.add(best["name"])
-        lineup.append({**best.to_dict(), "slot": pos})
-
-    return pd.DataFrame(lineup)
+    rows = list(pool.itertuples(index=False))
+    combos = sorted(combinations(rows, 5), key=lambda c: -sum(p.predicted_score for p in c))
+    for combo in combos:
+        for perm in permutations(combo):
+            if all(pos in p.positions for pos, p in zip(STANDARD_POSITIONS, perm, strict=True)):
+                df = pd.DataFrame([p._asdict() for p in perm])
+                df["slot"] = STANDARD_POSITIONS
+                return df
+    return None
 
 
 def brute_force_best_five(pool: pd.DataFrame) -> pd.DataFrame | None:
@@ -100,12 +89,11 @@ def brute_force_best_five(pool: pd.DataFrame) -> pd.DataFrame | None:
     if len(pool) < 5:
         return None
 
-    scores = [float(x) for x in pool["predicted_score"]]
-    best_score = -1.0
-    best_combo: tuple[int, ...] | None = None
+    best_score = -1
+    best_combo = None
 
-    for combo in combinations(range(len(pool)), 5):
-        total = sum(scores[i] for i in combo)
+    for combo in combinations(pool.itertuples(index=False), 5):
+        total = sum(p.predicted_score for p in combo)
         if total > best_score:
             best_score = total
             best_combo = combo
@@ -113,7 +101,8 @@ def brute_force_best_five(pool: pd.DataFrame) -> pd.DataFrame | None:
     if not best_combo:
         return None
 
-    df = pool.iloc[list(best_combo)].reset_index(drop=True)
+    rows = [c._asdict() for c in best_combo]
+    df = pd.DataFrame(rows)
     df["slot"] = STANDARD_POSITIONS[: len(df)]
     return df
 
@@ -147,13 +136,13 @@ def optimize_lineup(
             "error": f"Only {len(pool)} active players available, need at least 5.",
         }
 
-    lineup = greedy_positional_lineup(pool) if use_positions else None
+    lineup = best_positional_lineup(pool) if use_positions else None
 
-    if lineup is None or len(lineup) < 5:
+    if lineup is None:
         lineup = brute_force_best_five(pool)
         method = "brute_force_top5"
     else:
-        method = "positional_greedy"
+        method = "positional_optimal"
 
     total = round(lineup["predicted_score"].sum(), 2) if lineup is not None else 0
 
