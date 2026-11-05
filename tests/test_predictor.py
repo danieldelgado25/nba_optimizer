@@ -1,13 +1,18 @@
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
 from conftest import make_game_log
+from nbaopt.config import metrics_path, normalizer_path
 from nbaopt.models import predictor
 from nbaopt.models.predictor import (
     LEAGUE_AVG_DEF_RATING,
-    GameSequenceDataset,
+    SEQ_LEN,
+    FeatureNormalizer,
+    build_sequences,
     compute_fantasy_score,
     predict_player_score,
     train_model,
@@ -33,6 +38,9 @@ def training_frame(n_players: int = 3, n_games: int = 20) -> pd.DataFrame:
 def test_compute_fantasy_score_uses_weights():
     row = pd.Series({"PTS": 20, "REB": 10, "AST": 5, "STL": 2, "BLK": 1, "TOV": 3})
     assert compute_fantasy_score(row) == pytest.approx(20 + 12 + 7.5 + 6 + 3 - 3)
+
+
+# ── Inference ─────────────────────────────────────────────────────────────────
 
 
 def test_injured_player_is_out(game_log):
@@ -66,22 +74,6 @@ def test_minutes_penalty_scales_low_minute_players(no_model):
     assert result["predicted_score"] == pytest.approx(result["base_score"] * 0.5, abs=0.01)
 
 
-def test_dataset_builds_next_game_targets():
-    df = training_frame(n_players=1, n_games=12)
-    ds = GameSequenceDataset(df, seq_len=10)
-    assert len(ds) == 2
-    x, y = ds[0]
-    assert tuple(x.shape) == (10, predictor.INPUT_SIZE)
-    assert float(y) == pytest.approx(compute_fantasy_score(df.iloc[10]))
-
-
-def test_train_model_writes_weights_and_normalizer(model_dir):
-    train_model(training_frame(), epochs=2, verbose=False)
-    assert model_dir.exists()
-    assert model_dir.with_name(model_dir.name + ".norm.npz").exists()
-
-
-@pytest.mark.xfail(strict=True, reason="Known bug: float64 normalizer output crashes the float32 LSTM (fixed in P2)")
 def test_trained_model_is_used_for_inference(model_dir, game_log):
     train_model(training_frame(), epochs=2, verbose=False)
     result = predict_player_score(game_log)
@@ -89,19 +81,82 @@ def test_trained_model_is_used_for_inference(model_dir, game_log):
     assert result["predicted_score"] >= 0
 
 
-def test_train_model_rejects_too_little_data(model_dir):
-    with pytest.raises(ValueError, match="Not enough rows"):
-        train_model(training_frame(n_players=1, n_games=5), epochs=1, verbose=False)
+def test_model_waits_for_a_full_window(model_dir):
+    train_model(training_frame(), epochs=1, verbose=False)
+    result = predict_player_score(make_game_log(SEQ_LEN - 1))
+    assert result["model_used"] == "rolling_avg_fallback"
 
 
-@pytest.mark.xfail(strict=True, reason="Known bug: windows span player boundaries (fixed in P2)")
-def test_dataset_does_not_cross_player_boundaries():
-    ds = GameSequenceDataset(training_frame(n_players=2, n_games=12), seq_len=10)
-    assert len(ds) == 4
+# ── Sequences ─────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.xfail(strict=True, reason="Known bug: constant OPP_DEF_RATING explodes normalization (fixed in P2)")
+def test_build_sequences_targets_the_next_game():
+    df = training_frame(n_players=1, n_games=12)
+    X, y, _, is_val = build_sequences(df, seq_len=10)
+    assert X.shape == (2, 10, predictor.INPUT_SIZE)
+    assert X.dtype == np.float32
+    assert y[0] == pytest.approx(compute_fantasy_score(df.iloc[10]), abs=1e-4)
+    assert not is_val.any()  # val_frac defaults to 0
+
+
+def test_build_sequences_does_not_cross_player_boundaries():
+    X, *_ = build_sequences(training_frame(n_players=2, n_games=12), seq_len=10)
+    assert len(X) == 4
+
+
+def test_build_sequences_opponent_baseline_and_holdout():
+    n = SEQ_LEN + 5
+
+    def player(pid, pts):
+        return pd.DataFrame({"PLAYER_ID": pid, "PTS": pts, "OPP_DEF_RATING": np.arange(n) + 100.0})
+
+    a, b = player(1, np.arange(n, dtype=float)), player(2, 1000.0)
+    X, y, base, is_val = build_sequences(pd.concat([a, b]), val_frac=0.2)
+
+    assert len(y) == 2 * 5
+    assert (y[:5] == np.arange(SEQ_LEN, n)).all()  # target = next game, chronological
+    assert (y[5:] == 1000).all() and (X[5:, :, 0] == 1000).all()
+    assert (X[0, :, -1] == 100 + SEQ_LEN).all()  # opponent feature = target game's opponent
+    ratio = np.clip((100 + SEQ_LEN) / LEAGUE_AVG_DEF_RATING, 0.85, 1.15)
+    assert base[0] == pytest.approx(np.arange(SEQ_LEN).mean() * ratio)
+    assert is_val.tolist() == [False] * 4 + [True] + [False] * 4 + [True]
+
+
+# ── Normalizer ────────────────────────────────────────────────────────────────
+
+
+def test_normalizer_constant_column():
+    norm = FeatureNormalizer()
+    norm.fit(np.array([[1.0, 113.5], [3.0, 113.5]]))
+    out = norm.transform(np.array([[2.0, 110.0]]))
+    assert np.allclose(out, [[0.0, -3.5]])
+
+
 def test_opponent_rating_normalizes_to_a_sane_range(model_dir, game_log):
-    _, normalizer = train_model(training_frame(), epochs=1, verbose=False)
+    _, normalizer, _ = train_model(training_frame(), epochs=1, verbose=False)
     seq = predictor._build_inference_sequence(game_log, opponent_def_rating=110.0)
     assert np.abs(normalizer.transform(seq)).max() < 10
+
+
+# ── Training ──────────────────────────────────────────────────────────────────
+
+
+def test_train_model_writes_weights_normalizer_and_metrics(model_dir):
+    _, _, metrics = train_model(training_frame(), epochs=2, verbose=False)
+    assert model_dir.exists()
+    assert normalizer_path(model_dir).exists()
+    saved = json.loads(metrics_path(model_dir).read_text())
+    assert set(metrics) == {"lstm", "baseline"}
+    assert set(metrics["lstm"]) == {"mae", "rmse"}
+    assert saved["val_games"] == 3 * 2  # ceil(10 windows * 0.2) per player
+    assert saved["train_samples"] == 3 * 8
+
+
+def test_train_model_without_holdout_has_no_metrics(model_dir):
+    _, _, metrics = train_model(training_frame(), epochs=1, val_frac=0.0, verbose=False)
+    assert metrics == {}
+
+
+def test_train_model_rejects_too_little_data(model_dir):
+    with pytest.raises(ValueError, match="Not enough games"):
+        train_model(training_frame(n_players=1, n_games=5), epochs=1, verbose=False)
