@@ -137,8 +137,8 @@ def build_sequences(
     X, y, baseline, is_val = [], [], [], []
 
     for _, g in groups:
-        values = g[feature_cols].values.astype(np.float32)
-        labels = g["FANTASY_SCORE"].values.astype(np.float32)
+        values = g[feature_cols].to_numpy(dtype=np.float32)
+        labels = g["FANTASY_SCORE"].to_numpy(dtype=np.float32)
         n = len(g) - seq_len
         if n <= 0:
             continue
@@ -477,11 +477,11 @@ def predict_player_score(
     # ── Choose prediction method ──────────────────────────────────────────────
     _ensure_model_loaded()
 
-    use_lstm = n_games >= MIN_GAMES_FOR_MODEL and _MODEL is not None and _NORMALIZER is not None
+    model, normalizer = _MODEL, _NORMALIZER
 
-    if use_lstm:
+    if n_games >= MIN_GAMES_FOR_MODEL and model is not None and normalizer is not None:
         sequence = _build_inference_sequence(game_log, opponent_def_rating)
-        base_score = _lstm_predict(_MODEL, _NORMALIZER, sequence)
+        base_score = _lstm_predict(model, normalizer, sequence)
         method = "lstm"
     else:
         base_score = _rolling_avg_predict(game_log, opponent_def_rating)
