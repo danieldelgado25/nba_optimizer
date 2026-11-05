@@ -8,4 +8,8 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .coverage
-artifacts/
+artifacts/*
+!artifacts/lstm_weights.pt
+!artifacts/lstm_weights.pt.norm.npz
+!artifacts/lstm_weights.pt.metrics.json
+data/train_*.csv

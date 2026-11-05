@@ -2,9 +2,10 @@ import pytest
 
 from conftest import active, make_roster
 from nbaopt.optimizer.lineup import (
+    STANDARD_POSITIONS,
+    best_positional_lineup,
     brute_force_best_five,
     build_player_pool,
-    greedy_positional_lineup,
     optimize_lineup,
     parse_positions,
 )
@@ -20,6 +21,7 @@ from nbaopt.optimizer.lineup import (
         ("F-C", {"SF", "PF", "C"}),
         ("pg/sg", {"PG", "SG"}),
         ("", set()),
+        (float("nan"), set()),  # missing POSITION in a CSV-loaded roster
     ],
 )
 def test_parse_positions(raw, expected):
@@ -48,6 +50,12 @@ SCORES = {
 }
 
 
+def assert_legal(lineup):
+    assert list(lineup["slot"]) == STANDARD_POSITIONS
+    for _, row in lineup.iterrows():
+        assert row["slot"] in row["positions"]
+
+
 def test_build_player_pool_excludes_inactive():
     scores = {**SCORES, "Wing Two": {"predicted_score": 0.0, "status": "OUT", "avg_minutes": 0, "rolling_stats": {}}}
     pool = build_player_pool(ROSTER, scores)
@@ -55,16 +63,16 @@ def test_build_player_pool_excludes_inactive():
     assert len(pool) == 6
 
 
-def test_greedy_fills_every_slot_by_position():
-    lineup = greedy_positional_lineup(build_player_pool(ROSTER, SCORES))
+def test_positional_lineup_fills_every_slot():
+    lineup = best_positional_lineup(build_player_pool(ROSTER, SCORES))
     assert lineup is not None
-    assert dict(zip(lineup["slot"], lineup["name"], strict=True)) == {
-        "PG": "Guard One",
-        "SG": "Guard Two",
-        "SF": "Wing One",
-        "PF": "Wing Two",
-        "C": "Big One",
-    }
+    assert_legal(lineup)
+    assert set(lineup["name"]) == {"Guard One", "Guard Two", "Wing One", "Wing Two", "Big One"}
+
+
+def test_positional_lineup_none_when_no_legal_five():
+    roster = make_roster([(f"Guard {i}", "G") for i in range(6)])
+    assert best_positional_lineup(build_player_pool(roster, {f"Guard {i}": active(10) for i in range(6)})) is None
 
 
 def test_brute_force_picks_top_five_by_score():
@@ -75,9 +83,16 @@ def test_brute_force_picks_top_five_by_score():
 
 def test_optimize_lineup_reports_totals():
     result = optimize_lineup(ROSTER, SCORES)
-    assert result["method"] == "positional_greedy"
+    assert result["method"] == "positional_optimal"
     assert result["total_predicted_score"] == pytest.approx(162)
     assert result["pool_size"] == 7
+
+
+def test_optimize_lineup_falls_back_without_a_legal_five():
+    roster = make_roster([(f"Guard {i}", "G") for i in range(6)])
+    result = optimize_lineup(roster, {f"Guard {i}": active(10 + i) for i in range(6)})
+    assert result["method"] == "brute_force_top5"
+    assert result["total_predicted_score"] == pytest.approx(11 + 12 + 13 + 14 + 15)
 
 
 def test_optimize_lineup_needs_five_active_players():
@@ -87,7 +102,6 @@ def test_optimize_lineup_needs_five_active_players():
     assert "need at least 5" in result["error"]
 
 
-@pytest.mark.xfail(strict=True, reason="Known bug: greedy slot filling is not optimal (fixed in P5)")
 def test_lineup_is_optimal_under_position_constraints():
     roster = make_roster(
         [
@@ -110,3 +124,25 @@ def test_lineup_is_optimal_under_position_constraints():
     result = optimize_lineup(roster, scores)
     # Best legal lineup: Pure Point at PG, Combo Guard at SG.
     assert result["total_predicted_score"] == pytest.approx(115)
+    assert_legal(result["lineup"])
+
+
+# The 2026-27 Celtics case the old greedy fill got wrong (benched a 23-pt guard)
+CELTICS = [
+    ("Tatum", "F-G", 44.57),
+    ("White", "G", 23.24),
+    ("George", "F", 38.92),
+    ("Robinson", "C-F", 13.75),
+    ("Queta", "C", 21.21),
+    ("Pritchard", "G", 23.08),
+    ("Hauser", "F", 12.58),
+]
+
+
+def test_celtics_regression():
+    roster = make_roster([(n, p) for n, p, _ in CELTICS])
+    result = optimize_lineup(roster, {n: active(s) for n, _, s in CELTICS})
+    assert result["method"] == "positional_optimal"
+    assert set(result["lineup"]["name"]) == {"Tatum", "White", "George", "Queta", "Pritchard"}
+    assert result["total_predicted_score"] == pytest.approx(151.02)
+    assert_legal(result["lineup"])

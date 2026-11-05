@@ -5,7 +5,8 @@ Predicts a fantasy-style performance score for each player using a PyTorch LSTM.
 Architecture:
   - Input sequence: last N games, each game encoded as a feature vector
   - LSTM layers learn temporal patterns (hot streaks, fatigue, matchup trends)
-  - Opponent DEF_RATING injected as a context feature at inference time
+  - The upcoming opponent's DEF_RATING is a context feature on every timestep
+    (in training: the target game's opponent; at inference: the next opponent)
   - Minutes penalty applied post-prediction for low-usage players
   - Falls back to rolling-average baseline if < MIN_GAMES_FOR_MODEL games exist
 
@@ -13,21 +14,22 @@ Drop-in replacement for the statistical predictor.py — predict_player_score()
 signature is identical.
 """
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, TensorDataset
 
-from nbaopt.config import model_path, normalizer_path
+from nbaopt.config import metrics_path, model_path, normalizer_path
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 LEAGUE_AVG_DEF_RATING = 113.5
-MIN_GAMES_FOR_MODEL = 5  # fall back to rolling avg below this
 SEQ_LEN = 10  # games fed into LSTM
+MIN_GAMES_FOR_MODEL = SEQ_LEN  # model never saw padded sequences, so fall back below this
 
 # Raw stat columns pulled from nba_api game log
 STAT_COLS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "MIN", "FG_PCT", "FG3_PCT", "FT_PCT", "PLUS_MINUS"]
@@ -98,49 +100,67 @@ class PlayerLSTM(nn.Module):
         return self.head(dropped).squeeze(-1)  # (batch,)
 
 
-# ── Dataset ───────────────────────────────────────────────────────────────────
+# ── Sequences ─────────────────────────────────────────────────────────────────
 
 
-class GameSequenceDataset(Dataset):
+def build_sequences(
+    df: pd.DataFrame,
+    seq_len: int = SEQ_LEN,
+    val_frac: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Builds (sequence, label) pairs from a DataFrame of game logs.
+    Slice game logs into (window of past games -> next game) samples.
 
-    Each sample:
-      X: (SEQ_LEN, INPUT_SIZE) — window of past games
-      y: float — fantasy score of the NEXT game (the one after the window)
+    Windows never cross players (grouped by PLAYER_ID when present). Each
+    player's rows must be ordered oldest -> newest. The OPP_DEF_RATING
+    feature of every timestep is set to the *target* game's opponent, so
+    training matches inference, where it is the upcoming opponent.
 
-    Expects a DataFrame with STAT_COLS + 'OPP_DEF_RATING' + 'FANTASY_SCORE'.
-    Games should be ordered oldest -> newest.
+    The last `val_frac` of each player's windows are flagged as validation,
+    giving a per-player time-based holdout.
+
+    Returns raw (unnormalized) arrays:
+      X        (n, seq_len, INPUT_SIZE)
+      y        (n,)  fantasy score of the target game
+      baseline (n,)  rolling-average prediction for the same target
+      is_val   (n,)  bool
     """
+    feature_cols = STAT_COLS + ["OPP_DEF_RATING"]
+    df = df.copy()
+    for col in feature_cols:
+        if col not in df.columns:
+            df[col] = LEAGUE_AVG_DEF_RATING if col == "OPP_DEF_RATING" else 0.0
+    df[feature_cols] = df[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    df["FANTASY_SCORE"] = sum(df[s] * w for s, w in SCORE_WEIGHTS.items())
 
-    def __init__(self, df: pd.DataFrame, seq_len: int = SEQ_LEN):
-        self.seq_len = seq_len
-        self.samples: list[tuple[np.ndarray, float]] = []
+    groups = df.groupby("PLAYER_ID", sort=False) if "PLAYER_ID" in df.columns else [(None, df)]
+    X, y, baseline, is_val = [], [], [], []
 
-        feature_cols = STAT_COLS + ["OPP_DEF_RATING"]
-        df = df.copy()
-        for col in feature_cols:
-            if col not in df.columns:
-                df[col] = 0.0
-        df[feature_cols] = df[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    for _, g in groups:
+        values = g[feature_cols].to_numpy(dtype=np.float32)
+        labels = g["FANTASY_SCORE"].to_numpy(dtype=np.float32)
+        n = len(g) - seq_len
+        if n <= 0:
+            continue
+        n_val = int(np.ceil(n * val_frac))
+        for i in range(n):
+            window = values[i : i + seq_len].copy()
+            opp = values[i + seq_len, -1]
+            window[:, -1] = opp
+            X.append(window)
+            y.append(labels[i + seq_len])
+            # same as _rolling_avg_predict: fantasy score is linear in the stats
+            ratio = np.clip(opp / LEAGUE_AVG_DEF_RATING, 0.85, 1.15)
+            baseline.append(labels[i : i + seq_len].mean() * ratio)
+            is_val.append(i >= n - n_val)
 
-        if "FANTASY_SCORE" not in df.columns:
-            df["FANTASY_SCORE"] = df.apply(compute_fantasy_score, axis=1)
-
-        values = df[feature_cols].values.astype(np.float32)
-        labels = df["FANTASY_SCORE"].values.astype(np.float32)
-
-        for i in range(len(df) - seq_len):
-            X = values[i : i + seq_len]
-            y = labels[i + seq_len]
-            self.samples.append((X, y))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        X, y = self.samples[idx]
-        return torch.tensor(X), torch.tensor(y)
+    F = len(feature_cols)
+    return (
+        np.array(X, dtype=np.float32).reshape(-1, seq_len, F),
+        np.array(y, dtype=np.float32),
+        np.array(baseline, dtype=np.float32),
+        np.array(is_val, dtype=bool),
+    )
 
 
 # ── Normalization ─────────────────────────────────────────────────────────────
@@ -159,7 +179,9 @@ class FeatureNormalizer:
 
     def fit(self, X: np.ndarray):
         self.mean_ = X.mean(axis=0)
-        self.std_ = X.std(axis=0) + 1e-8
+        std = X.std(axis=0)
+        # a constant column would otherwise blow up any unseen value by ~1e8
+        self.std_ = np.where(std < 1e-6, 1.0, std)
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         return (X - self.mean_) / self.std_
@@ -187,64 +209,60 @@ class FeatureNormalizer:
 
 def train_model(
     game_logs_df: pd.DataFrame,
-    epochs: int = 30,
+    epochs: int = 6,
     lr: float = 1e-3,
     batch_size: int = 32,
     seq_len: int = SEQ_LEN,
+    val_frac: float = 0.2,
     save_path: str | Path | None = None,
     verbose: bool = True,
-) -> tuple["PlayerLSTM", "FeatureNormalizer"]:
+) -> tuple["PlayerLSTM", "FeatureNormalizer", dict]:
     """
-    Train the LSTM on a historical game-log DataFrame.
+    Train the LSTM on a historical game-log DataFrame and evaluate it against
+    the rolling-average baseline on a held-out set.
 
-    game_logs_df should have columns matching STAT_COLS + 'OPP_DEF_RATING'.
-    Rows are individual games sorted oldest -> newest.
-    Multiple players' logs can be concatenated together for a shared model.
+    game_logs_df should have columns matching STAT_COLS + 'OPP_DEF_RATING'
+    (+ 'PLAYER_ID' when several players are concatenated). Each player's
+    rows are sorted oldest -> newest.
+
+    The last `val_frac` of each player's games are held out: the model and
+    normalizer are fit only on the earlier games.
 
     Saves:
-      save_path           — model weights (.pt), default config.model_path()
-      save_path.norm.npz  — normalizer stats
+      save_path              — model weights (.pt), default config.model_path()
+      save_path.norm.npz     — normalizer stats
+      save_path.metrics.json — held-out evaluation
 
-    Returns (model, normalizer).
-
-    Example
-    -------
-    from data.fetcher import get_player_game_log
-    from models.predictor import train_model
-    import pandas as pd
-
-    logs = []
-    for pid in player_ids:
-        df = get_player_game_log(pid, last_n=82)
-        df["OPP_DEF_RATING"] = 113.5   # add opponent rating per game if available
-        logs.append(df)
-
-    all_logs = pd.concat(logs, ignore_index=True)
-    model, normalizer = train_model(all_logs, epochs=30)
+    Returns (model, normalizer, metrics), where metrics holds MAE/RMSE for
+    "lstm" and "baseline" on the validation set (empty if val_frac == 0).
     """
-    df = game_logs_df.copy()
-    feature_cols = STAT_COLS + ["OPP_DEF_RATING"]
-
-    for col in feature_cols:
-        if col not in df.columns:
-            df[col] = 0.0
-    df[feature_cols] = df[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
-
-    if "FANTASY_SCORE" not in df.columns:
-        df["FANTASY_SCORE"] = df.apply(compute_fantasy_score, axis=1)
+    torch.manual_seed(0)  # reproducible weights + reported metrics
+    X, y, baseline, is_val = build_sequences(game_logs_df, seq_len=seq_len, val_frac=val_frac)
+    is_train = ~is_val
+    if not is_train.any():
+        raise ValueError(f"Not enough games to build training sequences (need > {seq_len} per player).")
 
     normalizer = FeatureNormalizer()
-    df[feature_cols] = normalizer.fit_transform(df[feature_cols].values)
+    normalizer.fit(X[is_train].reshape(-1, X.shape[-1]))
+    Xn = normalizer.transform(X).astype(np.float32)
 
-    dataset = GameSequenceDataset(df, seq_len=seq_len)
-    if len(dataset) == 0:
-        raise ValueError(f"Not enough rows to build sequences. Need > {seq_len} games, got {len(df)}.")
-
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    train_ds = TensorDataset(torch.from_numpy(Xn[is_train]), torch.from_numpy(y[is_train]))
+    loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     model = PlayerLSTM()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    X_val = torch.from_numpy(Xn[is_val])
+
+    def val_preds() -> np.ndarray:
+        model.eval()
+        with torch.no_grad():
+            preds = model(X_val).numpy()
+        model.train()
+        return np.maximum(preds, 0.0)  # same clamp as _lstm_predict
+
+    if verbose:
+        print(f"  Samples: {is_train.sum()} train / {is_val.sum()} validation\n")
 
     model.train()
     for epoch in range(1, epochs + 1):
@@ -261,17 +279,40 @@ def train_model(
 
         if verbose and (epoch % 5 == 0 or epoch == 1):
             avg_loss = epoch_loss / len(loader)
-            print(f"  Epoch {epoch:>3}/{epochs}  MSE Loss: {avg_loss:.4f}")
+            val_msg = f"  Val MAE: {np.abs(val_preds() - y[is_val]).mean():.3f}" if is_val.any() else ""
+            print(f"  Epoch {epoch:>3}/{epochs}  Train MSE: {avg_loss:.4f}{val_msg}")
+
+    metrics = {}
+    if is_val.any():
+        metrics = {
+            "lstm": _errors(val_preds(), y[is_val]),
+            "baseline": _errors(baseline[is_val], y[is_val]),
+        }
+        if verbose:
+            print(f"\n  Held-out evaluation ({is_val.sum()} games, fantasy points)")
+            print(f"  {'MODEL':<22} {'MAE':>7} {'RMSE':>7}")
+            for name, m in metrics.items():
+                print(f"  {name:<22} {m['mae']:>7.3f} {m['rmse']:>7.3f}")
+            gain = 1 - metrics["lstm"]["mae"] / metrics["baseline"]["mae"]
+            print(f"\n  LSTM MAE vs baseline: {gain:+.1%}")
 
     weights_path = Path(save_path) if save_path else model_path()
     weights_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), weights_path)
     normalizer.save(str(normalizer_path(weights_path)))
+    with open(metrics_path(weights_path), "w") as f:
+        json.dump({**metrics, "val_games": int(is_val.sum()), "train_samples": int(is_train.sum())}, f, indent=2)
     if verbose:
         print(f"\n  Model saved  → {weights_path}")
         print(f"  Normalizer   → {normalizer_path(weights_path)}")
+        print(f"  Metrics      → {metrics_path(weights_path)}")
 
-    return model, normalizer
+    return model, normalizer, metrics
+
+
+def _errors(pred: np.ndarray, actual: np.ndarray) -> dict:
+    err = pred - actual
+    return {"mae": float(np.abs(err).mean()), "rmse": float(np.sqrt((err**2).mean()))}
 
 
 # ── Inference helpers ─────────────────────────────────────────────────────────
@@ -296,8 +337,8 @@ def _build_inference_sequence(
     seq_len: int = SEQ_LEN,
 ) -> np.ndarray:
     """
-    Convert a player's recent game log into a (seq_len, input_size) float32 array.
-    Pads with zeros on the left if fewer than seq_len games exist.
+    Convert a player's recent game log (oldest -> newest, >= seq_len games)
+    into a (seq_len, input_size) float32 array of the most recent games.
     """
     feature_cols = STAT_COLS + ["OPP_DEF_RATING"]
     df = game_log.copy()
@@ -308,12 +349,7 @@ def _build_inference_sequence(
             df[col] = 0.0
     df[feature_cols] = df[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
 
-    values = df[feature_cols].values[-seq_len:].astype(np.float32)
-    if len(values) < seq_len:
-        pad = np.zeros((seq_len - len(values), len(feature_cols)), dtype=np.float32)
-        values = np.vstack([pad, values])
-
-    return values
+    return df[feature_cols].values[-seq_len:].astype(np.float32)
 
 
 def _lstm_predict(
@@ -323,7 +359,7 @@ def _lstm_predict(
 ) -> float:
     """Run one (seq_len, input_size) sequence through the LSTM and return a score."""
     normed = normalizer.transform(sequence)
-    tensor = torch.tensor(normed).unsqueeze(0)  # (1, seq_len, input_size)
+    tensor = torch.tensor(normed, dtype=torch.float32).unsqueeze(0)  # (1, seq_len, input_size)
     with torch.no_grad():
         score = model(tensor).item()
     return max(0.0, round(score, 2))
@@ -443,9 +479,11 @@ def predict_player_score(
     # ── Choose prediction method ──────────────────────────────────────────────
     _ensure_model_loaded()
 
-    if n_games >= MIN_GAMES_FOR_MODEL and _MODEL is not None and _NORMALIZER is not None:
+    model, normalizer = _MODEL, _NORMALIZER
+
+    if n_games >= MIN_GAMES_FOR_MODEL and model is not None and normalizer is not None:
         sequence = _build_inference_sequence(game_log, opponent_def_rating)
-        base_score = _lstm_predict(_MODEL, _NORMALIZER, sequence)
+        base_score = _lstm_predict(model, normalizer, sequence)
         method = "lstm"
     else:
         base_score = _rolling_avg_predict(game_log, opponent_def_rating)

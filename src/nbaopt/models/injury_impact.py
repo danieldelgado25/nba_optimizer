@@ -3,48 +3,33 @@ injury_impact.py
 Models the impact of removing a player from the lineup.
 
 Calculates:
-  - Team projected score WITH player
-  - Team projected score WITHOUT player (redistributing usage)
+  - Optimal lineup projected score WITH player
+  - Optimal lineup projected score WITHOUT player (re-optimized from the bench)
   - Impact delta and impact percentage
-  - Which players absorb the usage
+  - Which players enter the lineup to replace them
 """
 
+import pandas as pd
 
-def estimate_usage_redistribution(
-    player_name: str,
-    roster_scores: dict[str, dict],
-    injured_player_score: float,
-    injured_player_minutes: float,
-) -> dict[str, float]:
-    """
-    When a player is out, distribute their projected score contribution
-    across remaining active players proportional to their own scores.
-
-    Returns a dict of player_name → score_boost.
-    """
-    active = {name: data for name, data in roster_scores.items() if name != player_name and data["status"] == "ACTIVE"}
-
-    total_active_score = sum(d["predicted_score"] for d in active.values())
-    if total_active_score == 0:
-        return {}
-
-    redistribution = {}
-    for name, data in active.items():
-        share = data["predicted_score"] / total_active_score
-        redistribution[name] = round(share * injured_player_score * 0.7, 2)  # 70% recovery assumption
-
-    return redistribution
+from nbaopt.optimizer.lineup import optimize_lineup
 
 
 def compute_injury_impact(
     injured_player_name: str,
+    roster_df: pd.DataFrame,
     roster_scores: dict[str, dict],
 ) -> dict:
     """
     Full injury impact report for one player being ruled out.
 
+    Impact = how much the optimal lineup's projected total drops when the
+    player is OUT and the lineup is re-optimized. The replacement absorbs the
+    lost minutes, so the delta is never negative, and a bench player who
+    doesn't make the optimal lineup has zero impact.
+
     Args:
         injured_player_name: Name of player who is OUT
+        roster_df: Roster from get_team_roster() (for positions)
         roster_scores: Dict of player_name → predict_player_score() output
 
     Returns:
@@ -57,18 +42,18 @@ def compute_injury_impact(
     lost_score = injured_data.get("predicted_score", 0)
     lost_minutes = injured_data.get("avg_minutes", 0)
 
-    # Team total WITH player
-    team_score_with = sum(d["predicted_score"] for d in roster_scores.values())
+    with_result = optimize_lineup(roster_df, roster_scores)
+    if with_result["lineup"] is None:
+        return {"error": "Not enough active players to build a lineup."}
 
-    # Team total WITHOUT player (with redistribution)
-    redistribution = estimate_usage_redistribution(
-        injured_player_name,
-        roster_scores,
-        lost_score,
-        lost_minutes,
-    )
+    scores_without = {**roster_scores, injured_player_name: {**injured_data, "status": "OUT", "predicted_score": 0.0}}
+    without_result = optimize_lineup(roster_df, scores_without)
+    if without_result["lineup"] is None:
+        return {"error": "Not enough active players to build a lineup without this player."}
 
-    team_score_without = team_score_with - lost_score + sum(redistribution.values())
+    team_score_with = with_result["total_predicted_score"]
+    team_score_without = without_result["total_predicted_score"]
+    replaced_by = sorted(set(without_result["lineup"]["name"]) - set(with_result["lineup"]["name"]))
 
     delta = round(team_score_with - team_score_without, 2)
     impact_pct = round((delta / team_score_with) * 100, 1) if team_score_with > 0 else 0
@@ -83,8 +68,6 @@ def compute_injury_impact(
     else:
         impact_level = "🟢 LOW"
 
-    top_absorbers = sorted(redistribution.items(), key=lambda x: x[1], reverse=True)[:3]
-
     return {
         "injured_player": injured_player_name,
         "player_projected_score": lost_score,
@@ -94,12 +77,11 @@ def compute_injury_impact(
         "score_delta": delta,
         "impact_percentage": impact_pct,
         "impact_level": impact_level,
-        "usage_absorbed_by": top_absorbers,
-        "redistribution_detail": redistribution,
+        "replaced_by": replaced_by,
     }
 
 
-def batch_injury_report(roster_scores: dict[str, dict]) -> list[dict]:
+def batch_injury_report(roster_df: pd.DataFrame, roster_scores: dict[str, dict]) -> list[dict]:
     """
     Run injury impact analysis for every player on the roster.
     Useful for showing 'what if X goes down?' for the full team.
@@ -108,7 +90,8 @@ def batch_injury_report(roster_scores: dict[str, dict]) -> list[dict]:
     reports = []
     for player_name in roster_scores:
         if roster_scores[player_name]["status"] == "ACTIVE":
-            report = compute_injury_impact(player_name, roster_scores)
-            reports.append(report)
+            report = compute_injury_impact(player_name, roster_df, roster_scores)
+            if "error" not in report:
+                reports.append(report)
 
     return sorted(reports, key=lambda x: x.get("impact_percentage", 0), reverse=True)

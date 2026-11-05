@@ -7,7 +7,8 @@ Usage:
     nbaopt lineup --team "BOS" --injured "Jaylen Brown"
     nbaopt lineup --team "Lakers" --injured "LeBron James" --opponent "Golden State Warriors"
     nbaopt lineup --team "Celtics" --impact-report
-    nbaopt train --team "Boston Celtics"
+    nbaopt train
+    nbaopt snapshot
 
 `python main.py ...` and `python train.py ...` remain as aliases for the two subcommands.
 """
@@ -79,15 +80,12 @@ def print_injury_impact(report: dict):
     print(f"\n  Player         : {report['injured_player']}")
     print(f"  Proj Score     : {report['player_projected_score']:.2f} pts")
     print(f"  Avg Minutes    : {report['player_avg_minutes']:.1f} min")
-    print(f"  Team Score WITH: {report['team_score_with']:.2f}")
-    print(f"  Team Score OUT : {report['team_score_without']:.2f}")
+    print(f"  Lineup WITH    : {report['team_score_with']:.2f}")
+    print(f"  Lineup WITHOUT : {report['team_score_without']:.2f}")
+    if report["replaced_by"]:
+        print(f"  Enters Lineup  : {', '.join(report['replaced_by'])}")
     print(f"  Score Delta    : -{report['score_delta']:.2f} ({report['impact_percentage']}%)")
     print(f"  Impact Level   : {report['impact_level']}")
-
-    if report["usage_absorbed_by"]:
-        print("\n  Top Usage Absorbers:")
-        for name, boost in report["usage_absorbed_by"]:
-            print(f"    +{boost:.2f}  {name}")
 
 
 def print_full_impact_report(reports: list[dict]):
@@ -102,6 +100,24 @@ def print_full_impact_report(reports: list[dict]):
 
 
 # ── Core pipeline ─────────────────────────────────────────────────────────────
+
+
+def resolve_player(query: str, names: list[str]) -> str | None:
+    """Exact (case-insensitive) name match, else a substring matching exactly one player."""
+    q = query.strip().lower()
+    for n in names:
+        if n.lower() == q:
+            return n
+    matches = [n for n in names if q in n.lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def resolve_or_exit(query: str, names: list[str]) -> str:
+    match = resolve_player(query, names)
+    if not match:
+        print(f"\n  ❌ '{query.strip()}' matches no player or several on this roster. Use the full name.")
+        sys.exit(1)
+    return match
 
 
 def build_roster_scores(
@@ -120,7 +136,7 @@ def build_roster_scores(
     for i, (_, player) in enumerate(roster_df.iterrows(), 1):
         name = player["PLAYER"]
         pid = player["PLAYER_ID"]
-        is_injured = any(inj.lower() in name.lower() for inj in injured_names)
+        is_injured = name in injured_names
 
         print(f"  [{i:>2}/{total}] {name} {'⛔ OUT' if is_injured else '...'}", end="\r")
 
@@ -170,7 +186,9 @@ def run(args):
     roster_df = get_team_roster(team_id, season=season)
     print(f"  ✅ Roster loaded: {len(roster_df)} players")
 
-    injured_names = [n.strip() for n in args.injured.split(",")] if args.injured else []
+    roster_names = roster_df["PLAYER"].tolist()
+    injured_names = [resolve_or_exit(q, roster_names) for q in args.injured.split(",")] if args.injured else []
+    impact_name = resolve_or_exit(args.injury_impact, roster_names) if args.injury_impact else None
     if injured_names:
         print(f"  ⛔ Marked as OUT: {', '.join(injured_names)}")
 
@@ -182,14 +200,14 @@ def run(args):
     print_lineup(result)
 
     # ── Injury impact for specific player ─────────────────────────────────────
-    if args.injury_impact:
-        section(f"🩺 INJURY IMPACT: {args.injury_impact}")
-        report = compute_injury_impact(args.injury_impact, roster_scores)
+    if impact_name:
+        section(f"🩺 INJURY IMPACT: {impact_name}")
+        report = compute_injury_impact(impact_name, roster_df, roster_scores)
         print_injury_impact(report)
 
     # ── Full impact report ────────────────────────────────────────────────────
     if args.impact_report:
-        reports = batch_injury_report(roster_scores)
+        reports = batch_injury_report(roster_df, roster_scores)
         print_full_impact_report(reports)
 
     print(f"\n{'═' * 62}\n")
@@ -229,6 +247,7 @@ def add_lineup_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from nbaopt.snapshot import main as run_snapshot
     from nbaopt.train import add_train_arguments, run_training
 
     parser = argparse.ArgumentParser(prog="nbaopt", description="NBA Lineup Optimizer with Injury Impact Analysis")
@@ -241,6 +260,9 @@ def build_parser() -> argparse.ArgumentParser:
     train = sub.add_parser("train", help="Train the LSTM predictor on team game logs")
     add_train_arguments(train)
     train.set_defaults(func=run_training)
+
+    snapshot = sub.add_parser("snapshot", help="Fetch current-season data for the Streamlit app")
+    snapshot.set_defaults(func=lambda _args: run_snapshot())
     return parser
 
 

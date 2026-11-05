@@ -19,26 +19,17 @@ ROSTER = make_roster(
 @pytest.fixture
 def offline(monkeypatch, no_model):
     """Replace every network call the CLI makes with synthetic data."""
-    captured: dict[str, list] = {"logs": []}
 
     def game_log(pid, last_n=10, season=None):
-        log = make_game_log(last_n, pts=10 + (pid - 1000) * 3, seed=pid)
-        return log
+        return make_game_log(last_n, pts=10 + (pid - 1000) * 3, newest_first=False, seed=pid)
 
-    def predict(log, opp_def_rating=113.5, injured=False):
-        captured["logs"].append(log)
-        return real_predict(log, opp_def_rating, injured)
-
-    real_predict = cli.predict_player_score
     monkeypatch.setattr(cli, "get_team_roster", lambda team_id, season=None: ROSTER)
     monkeypatch.setattr(cli, "get_player_game_log", game_log)
-    monkeypatch.setattr(cli, "predict_player_score", predict)
     monkeypatch.setattr(
         cli,
         "get_team_defensive_rating",
         lambda season=None: pd.DataFrame([{"TEAM_ID": 1610612744, "DEF_RATING": 110.0}]),
     )
-    return captured
 
 
 def test_parser_subcommands():
@@ -68,8 +59,21 @@ def test_unknown_team_exits(offline):
         cli.main(["lineup", "--team", "Nowhere FC"])
 
 
-@pytest.mark.xfail(strict=True, reason="Known bug: game logs reach the predictor newest-first (fixed in P2)")
-def test_predictor_receives_logs_oldest_first(offline):
-    cli.main(["lineup", "--team", "BOS"])
-    dates = pd.to_datetime(offline["logs"][0]["GAME_DATE"], format="%b %d, %Y")
-    assert dates.is_monotonic_increasing
+def test_injured_accepts_unique_partial_names(offline, capsys):
+    cli.main(["lineup", "--team", "BOS", "--injured", "bench guard, big one"])
+    assert "Marked as OUT: Bench Guard, Big One" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("flag", ["--injured", "--injury-impact"])
+def test_ambiguous_player_name_exits(offline, capsys, flag):
+    with pytest.raises(SystemExit):
+        cli.main(["lineup", "--team", "BOS", flag, "Guard"])  # Guard One, Guard Two, Bench Guard
+    assert "matches no player or several" in capsys.readouterr().out
+
+
+def test_resolve_player():
+    names = ["Jaylen Brown", "Bruce Brown", "Jayson Tatum"]
+    assert cli.resolve_player("Brown", names) is None
+    assert cli.resolve_player("jaylen brown", names) == "Jaylen Brown"
+    assert cli.resolve_player("Tatum", names) == "Jayson Tatum"
+    assert cli.resolve_player("Nobody", names) is None

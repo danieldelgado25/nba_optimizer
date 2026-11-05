@@ -8,10 +8,8 @@ import time
 import pandas as pd
 from nba_api.stats.endpoints import (
     commonteamroster,
-    leaguedashplayerstats,
     leaguedashteamstats,
     playergamelog,
-    scoreboardv2,
 )
 from nba_api.stats.static import teams as nba_teams_static
 
@@ -19,21 +17,21 @@ from nbaopt.config import current_season
 
 
 def get_team_id(team_name: str) -> int | None:
-    """Return NBA team ID by full name, city, or abbreviation."""
+    """
+    Return NBA team ID by abbreviation, nickname, or full name (exact match),
+    else by a substring of the full name if it matches exactly one team.
+    """
     all_teams = nba_teams_static.get_teams()
-    team_name_lower = team_name.lower()
+    q = team_name.strip().lower()
     for t in all_teams:
-        if (
-            team_name_lower in t["full_name"].lower()
-            or team_name_lower == t["abbreviation"].lower()
-            or team_name_lower in t["nickname"].lower()
-        ):
+        if q in (t["abbreviation"].lower(), t["nickname"].lower(), t["full_name"].lower()):
             return t["id"]
-    return None
+    matches = [t for t in all_teams if q in t["full_name"].lower()]
+    return matches[0]["id"] if len(matches) == 1 else None
 
 
 def get_team_roster(team_id: int, season: str | None = None) -> pd.DataFrame:
-    """Return current roster for a team."""
+    """Return roster for a team."""
     time.sleep(0.6)
     roster = commonteamroster.CommonTeamRoster(team_id=team_id, season=season or current_season())
     df = roster.get_data_frames()[0]
@@ -41,7 +39,7 @@ def get_team_roster(team_id: int, season: str | None = None) -> pd.DataFrame:
 
 
 def get_player_game_log(player_id: int, last_n: int = 10, season: str | None = None) -> pd.DataFrame:
-    """Return last N games for a player."""
+    """Return a player's last N games, ordered oldest -> newest."""
     time.sleep(0.6)
     log = playergamelog.PlayerGameLog(
         player_id=player_id,
@@ -67,19 +65,9 @@ def get_player_game_log(player_id: int, last_n: int = 10, season: str | None = N
         "FT_PCT",
         "PLUS_MINUS",
     ]
-    df = df[cols].head(last_n)
+    # nba_api returns newest first: take the latest N, then flip to chronological
+    df = df[cols].head(last_n).iloc[::-1].reset_index(drop=True)
     df["MIN"] = pd.to_numeric(df["MIN"], errors="coerce").fillna(0)
-    return df
-
-
-def get_league_player_stats(season: str | None = None) -> pd.DataFrame:
-    """Season averages for all players."""
-    time.sleep(0.6)
-    stats = leaguedashplayerstats.LeagueDashPlayerStats(
-        season=season or current_season(),
-        per_mode_simple="PerGame",
-    )
-    df = stats.get_data_frames()[0]
     return df
 
 
@@ -88,18 +76,23 @@ def get_team_defensive_rating(season: str | None = None) -> pd.DataFrame:
     time.sleep(0.6)
     stats = leaguedashteamstats.LeagueDashTeamStats(
         season=season or current_season(),
-        measure_type_simple="Advanced",
-        per_mode_simple="PerGame",
+        measure_type_detailed_defense="Advanced",
+        per_mode_detailed="PerGame",
     )
     df = stats.get_data_frames()[0]
-    return df[["TEAM_ID", "TEAM_NAME", "DEF_RATING", "OPP_PTS_OFF_TOV", "OPP_PTS_2ND_CHANCE"]]
+    return df[["TEAM_ID", "TEAM_NAME", "DEF_RATING"]]
 
 
-def get_todays_games() -> pd.DataFrame:
-    """Return today's scheduled matchups."""
-    time.sleep(0.6)
-    board = scoreboardv2.ScoreboardV2()
-    games = board.get_data_frames()[0]
-    if games.empty:
-        return pd.DataFrame()
-    return games[["GAME_ID", "HOME_TEAM_ID", "VISITOR_TEAM_ID", "GAME_STATUS_TEXT"]]
+def opponent_abbr(matchup: pd.Series) -> pd.Series:
+    """'BOS vs. MIA' / 'BOS @ MIA' -> 'MIA'."""
+    return matchup.str.split().str[-1]
+
+
+def def_rating_by_abbr(def_df: pd.DataFrame) -> dict[str, float]:
+    """Map team abbreviation -> DEF_RATING, for joining against MATCHUP strings."""
+    id_to_abbr = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
+    return {
+        id_to_abbr[tid]: float(r)
+        for tid, r in zip(def_df["TEAM_ID"], def_df["DEF_RATING"], strict=True)
+        if tid in id_to_abbr
+    }
