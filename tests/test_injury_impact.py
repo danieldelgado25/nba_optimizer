@@ -1,52 +1,73 @@
 import pytest
 
-from conftest import active
-from nbaopt.models.injury_impact import batch_injury_report, compute_injury_impact, estimate_usage_redistribution
+from conftest import active, make_roster
+from nbaopt.models.injury_impact import batch_injury_report, compute_injury_impact
 
-ROSTER_SCORES = {
-    "Star": active(50, 36),
-    "Starter": active(30, 30),
-    "Role": active(20, 24),
-    "Out Guy": {"predicted_score": 0.0, "status": "OUT", "avg_minutes": 0, "rolling_stats": {}},
-}
-
-
-def test_redistribution_is_proportional_and_recovers_70_percent():
-    boosts = estimate_usage_redistribution("Star", ROSTER_SCORES, 50, 36)
-    assert set(boosts) == {"Starter", "Role"}
-    assert boosts["Starter"] == pytest.approx(50 * 0.7 * 30 / 50)
-    assert boosts["Role"] == pytest.approx(50 * 0.7 * 20 / 50)
-    assert sum(boosts.values()) == pytest.approx(35)
+CELTICS = [
+    ("Tatum", "F-G", 44.57),
+    ("White", "G", 23.24),
+    ("George", "F", 38.92),
+    ("Robinson", "C-F", 13.75),
+    ("Queta", "C", 21.21),
+    ("Pritchard", "G", 23.08),
+    ("Hauser", "F", 12.58),
+]
+ROSTER = make_roster([(n, p) for n, p, _ in CELTICS])
+SCORES = {n: active(s) for n, _, s in CELTICS}
 
 
-def test_redistribution_with_no_active_teammates():
-    assert estimate_usage_redistribution("Star", {"Star": active(50)}, 50, 36) == {}
-
-
-def test_compute_injury_impact():
-    report = compute_injury_impact("Star", ROSTER_SCORES)
-    assert report["team_score_with"] == pytest.approx(100)
-    assert report["team_score_without"] == pytest.approx(85)
-    assert report["score_delta"] == pytest.approx(15)
-    assert report["impact_percentage"] == pytest.approx(15.0)
+def test_impact_is_drop_in_reoptimized_lineup():
+    report = compute_injury_impact("Tatum", ROSTER, SCORES)
+    assert report["team_score_with"] == pytest.approx(151.02)
+    assert report["score_delta"] == pytest.approx(44.57 - 13.75)
+    assert report["team_score_without"] == pytest.approx(151.02 - (44.57 - 13.75))
+    assert report["replaced_by"] == ["Robinson"]
+    assert report["impact_percentage"] == pytest.approx(round(100 * (44.57 - 13.75) / 151.02, 1))
     assert "CRITICAL" in report["impact_level"]
-    assert report["usage_absorbed_by"][0][0] == "Starter"
+
+
+def test_bench_player_has_zero_impact():
+    report = compute_injury_impact("Hauser", ROSTER, SCORES)
+    assert report["score_delta"] == 0
+    assert report["replaced_by"] == []
+    assert "LOW" in report["impact_level"]
+
+
+@pytest.mark.parametrize("name", list(SCORES))
+def test_impact_is_never_negative(name):
+    assert compute_injury_impact(name, ROSTER, SCORES)["score_delta"] >= 0
 
 
 @pytest.mark.parametrize(
-    ("role_score", "level"),
-    [(1, "LOW"), (12, "MODERATE"), (40, "HIGH")],
+    ("sub_score", "level"),
+    [(19, "LOW"), (16, "MODERATE"), (12, "HIGH"), (5, "CRITICAL")],
 )
-def test_impact_levels(role_score, level):
-    scores = {"Star": active(100), "Role": active(role_score)}
-    report = compute_injury_impact("Role", scores)
+def test_impact_levels(sub_score, level):
+    # Five 20-point starters (total 100) and one backup center: losing the
+    # starting center costs exactly 20 - sub_score, i.e. that many percent.
+    roster = make_roster([("G1", "G"), ("G2", "G"), ("F1", "F"), ("F2", "F"), ("C1", "C"), ("Sub", "C")])
+    scores = {n: active(20) for n in ["G1", "G2", "F1", "F2", "C1"]} | {"Sub": active(sub_score)}
+    report = compute_injury_impact("C1", roster, scores)
+    assert report["impact_percentage"] == pytest.approx(20 - sub_score)
     assert level in report["impact_level"]
 
 
 def test_unknown_player_returns_error():
-    assert "error" in compute_injury_impact("Nobody", ROSTER_SCORES)
+    assert "error" in compute_injury_impact("Nobody", ROSTER, SCORES)
+
+
+def test_no_replacement_available_returns_error():
+    roster = make_roster([("G1", "G"), ("G2", "G"), ("F1", "F"), ("F2", "F"), ("C1", "C")])
+    scores = {n: active(20) for n in roster["PLAYER"]}
+    assert "error" in compute_injury_impact("C1", roster, scores)
 
 
 def test_batch_report_skips_inactive_and_sorts_by_impact():
-    reports = batch_injury_report(ROSTER_SCORES)
-    assert [r["injured_player"] for r in reports] == ["Star", "Starter", "Role"]
+    scores = {**SCORES, "Queta": {"predicted_score": 0.0, "status": "OUT", "avg_minutes": 0, "rolling_stats": {}}}
+    reports = batch_injury_report(ROSTER, scores)
+    names = [r["injured_player"] for r in reports]
+    assert "Queta" not in names
+    assert len(names) == len(SCORES) - 1
+    pcts = [r["impact_percentage"] for r in reports]
+    assert pcts == sorted(pcts, reverse=True)
+    assert names[0] == "Tatum"
