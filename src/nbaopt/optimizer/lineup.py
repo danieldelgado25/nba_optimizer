@@ -69,12 +69,14 @@ def best_positional_lineup(pool: pd.DataFrame) -> pd.DataFrame | None:
 
     Combos are tried best-total first, so the first feasible one is optimal.
     """
-    rows = list(pool.itertuples(index=False))
-    combos = sorted(combinations(rows, 5), key=lambda c: -sum(p.predicted_score for p in c))
+    # Typed copies of the columns: DataFrame cells are an untyped scalar union.
+    scores: list[float] = [float(s) for s in pool["predicted_score"]]
+    positions: list[list[str]] = [list(p) for p in pool["positions"]]
+    combos = sorted(combinations(range(len(pool)), 5), key=lambda c: -sum(scores[i] for i in c))
     for combo in combos:
         for perm in permutations(combo):
-            if all(pos in p.positions for pos, p in zip(STANDARD_POSITIONS, perm, strict=True)):
-                df = pd.DataFrame([p._asdict() for p in perm])
+            if all(pos in positions[i] for pos, i in zip(STANDARD_POSITIONS, perm, strict=True)):
+                df = pool.iloc[list(perm)].reset_index(drop=True)
                 df["slot"] = STANDARD_POSITIONS
                 return df
     return None
@@ -89,21 +91,11 @@ def brute_force_best_five(pool: pd.DataFrame) -> pd.DataFrame | None:
     if len(pool) < 5:
         return None
 
-    best_score = -1
-    best_combo = None
+    scores: list[float] = [float(s) for s in pool["predicted_score"]]
+    best_combo = max(combinations(range(len(pool)), 5), key=lambda c: sum(scores[i] for i in c))
 
-    for combo in combinations(pool.itertuples(index=False), 5):
-        total = sum(p.predicted_score for p in combo)
-        if total > best_score:
-            best_score = total
-            best_combo = combo
-
-    if not best_combo:
-        return None
-
-    rows = [c._asdict() for c in best_combo]
-    df = pd.DataFrame(rows)
-    df["slot"] = STANDARD_POSITIONS[: len(df)]
+    df = pool.iloc[list(best_combo)].reset_index(drop=True)
+    df["slot"] = STANDARD_POSITIONS
     return df
 
 
