@@ -31,9 +31,27 @@ def test_current_season_defaults_to_today(monkeypatch):
     assert config.current_season() == config.season_for_date(date.today())
 
 
+@pytest.mark.parametrize(
+    ("season", "expected"),
+    [("2026-27", "2025-26"), ("2000-01", "1999-00"), ("1999-00", "1998-99")],
+)
+def test_previous_season(season, expected):
+    assert config.previous_season(season) == expected
+
+
+def test_previous_season_defaults_to_current(monkeypatch):
+    monkeypatch.setenv("NBAOPT_SEASON", "2026-27")
+    assert config.previous_season() == "2025-26"
+
+
 def test_model_path_default_and_override(monkeypatch, tmp_path):
     monkeypatch.delenv("NBAOPT_MODEL_PATH", raising=False)
     assert config.model_path() == Path.cwd() / "artifacts" / "lstm_weights.pt"
     monkeypatch.setenv("NBAOPT_MODEL_PATH", str(tmp_path / "w.pt"))
     assert config.model_path() == tmp_path / "w.pt"
     assert config.normalizer_path(tmp_path / "w.pt") == tmp_path / "w.pt.norm.npz"
+    assert config.metrics_path(tmp_path / "w.pt") == tmp_path / "w.pt.metrics.json"
+
+
+def test_snapshot_dir():
+    assert config.snapshot_dir() == Path.cwd() / "data" / "snapshot"

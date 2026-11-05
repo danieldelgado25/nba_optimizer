@@ -36,8 +36,19 @@ def test_get_team_id_unknown():
     assert fetcher.get_team_id("Seattle Supersonics") is None
 
 
+def test_get_team_id_prefers_exact_nickname_over_substring():
+    # "nets" is also a substring of "Charlotte Hornets"
+    assert fetcher.get_team_id("Nets") == fetcher.get_team_id("BKN")
+    assert fetcher.get_team_id("hornets") == fetcher.get_team_id("CHA")
+    assert fetcher.get_team_id("BKN") != fetcher.get_team_id("CHA")
+
+
+def test_get_team_id_ambiguous_substring():
+    assert fetcher.get_team_id("Los Angeles") is None  # Lakers or Clippers
+
+
 def test_get_player_game_log_trims_and_coerces(monkeypatch, fake):
-    raw = make_game_log(15)
+    raw = make_game_log(15)  # newest first, like nba_api
     raw["MIN"] = raw["MIN"].astype(str)
     raw.loc[0, "MIN"] = "bad"
     raw["EXTRA"] = 1
@@ -49,10 +60,32 @@ def test_get_player_game_log_trims_and_coerces(monkeypatch, fake):
 
     assert len(log) == 10
     assert "EXTRA" not in log.columns
-    assert log["MIN"].iloc[0] == 0
+    assert log["MIN"].iloc[-1] == 0  # the newest game, now last
     assert pd.api.types.is_numeric_dtype(log["MIN"])
     assert fake.calls[0]["player_id"] == 42
     assert fake.calls[0]["season"] == "2025-26"
+
+
+def test_get_player_game_log_keeps_latest_games_oldest_first(monkeypatch, fake):
+    raw = make_game_log(15)
+    fake.frame = raw
+    monkeypatch.setattr(fetcher.playergamelog, "PlayerGameLog", fake)
+
+    log = fetcher.get_player_game_log(42, last_n=10)
+
+    dates = pd.to_datetime(log["GAME_DATE"], format="%b %d, %Y")
+    assert dates.is_monotonic_increasing
+    assert log["GAME_DATE"].iloc[-1] == raw["GAME_DATE"].iloc[0]  # newest game kept
+    assert log["GAME_DATE"].iloc[0] == raw["GAME_DATE"].iloc[9]  # 5 oldest dropped
+
+
+def test_opponent_abbr():
+    assert fetcher.opponent_abbr(pd.Series(["BOS vs. MIA", "BOS @ LAL"])).tolist() == ["MIA", "LAL"]
+
+
+def test_def_rating_by_abbr():
+    df = pd.DataFrame({"TEAM_ID": [1610612738, 999], "DEF_RATING": [110.5, 100.0]})
+    assert fetcher.def_rating_by_abbr(df) == {"BOS": 110.5}
 
 
 def test_get_player_game_log_empty(monkeypatch, fake):
