@@ -132,6 +132,11 @@ def test_normalizer_constant_column():
     assert np.allclose(out, [[0.0, -3.5]])
 
 
+def test_normalizer_must_be_fit_before_saving(tmp_path):
+    with pytest.raises(ValueError, match="fit before saving"):
+        FeatureNormalizer().save(str(tmp_path / "norm.npz"))
+
+
 def test_opponent_rating_normalizes_to_a_sane_range(model_dir, game_log):
     _, normalizer, _ = train_model(training_frame(), epochs=1, verbose=False)
     seq = predictor._build_inference_sequence(game_log, opponent_def_rating=110.0)
