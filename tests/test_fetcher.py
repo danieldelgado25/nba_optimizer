@@ -150,3 +150,11 @@ def test_get_injury_report_empty(monkeypatch):
     df = fetcher.get_injury_report()
     assert df.empty
     assert list(df.columns) == fetcher.INJURY_COLUMNS
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [("Luka Dončić", "Luka Doncic"), ("Ernest Udeh, Jr.", "Ernest Udeh Jr"), ("Nae'Qwan Tomlin", "naeqwan  tomlin")],
+)
+def test_name_key_matches_across_sources(a, b):
+    assert fetcher.name_key(a) == fetcher.name_key(b)

@@ -9,6 +9,7 @@ Run locally:
 
 import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
@@ -18,6 +19,7 @@ import streamlit as st  # noqa: E402
 from nba_api.stats.static import teams as nba_teams_static  # noqa: E402
 
 from nbaopt.config import metrics_path, model_path, snapshot_dir  # noqa: E402
+from nbaopt.data.fetcher import get_injury_report, name_key  # noqa: E402
 from nbaopt.models.injury_impact import batch_injury_report  # noqa: E402
 from nbaopt.models.predictor import LEAGUE_AVG_DEF_RATING, predict_player_score  # noqa: E402
 from nbaopt.optimizer.lineup import optimize_lineup  # noqa: E402
@@ -36,6 +38,19 @@ def load_snapshot():
     return rosters, read("game_logs.csv"), read("def_ratings.csv"), fetched_at
 
 
+@st.cache_data(ttl=3600)
+def load_injuries() -> tuple[dict[str, str], str]:
+    """{name_key: ESPN status} and where it came from: live ESPN, else the snapshot copy, else nothing."""
+    try:
+        report, source = get_injury_report(), f"ESPN, live as of {datetime.now(UTC):%Y-%m-%d %H:%M} UTC"
+    except Exception:
+        try:
+            report, source = pd.read_csv(snapshot_dir() / "injuries.csv"), f"ESPN, from snapshot {fetched_at}"
+        except FileNotFoundError:
+            return {}, "unavailable"
+    return dict(zip(report["PLAYER"].map(name_key), report["STATUS"], strict=True)), source
+
+
 @st.cache_data
 def analyze(team_id: int, opp_rating: float, injured: tuple[str, ...]):
     roster = rosters[rosters["TEAM_ID"] == team_id]
@@ -49,6 +64,7 @@ def analyze(team_id: int, opp_rating: float, injured: tuple[str, ...]):
 
 
 rosters, logs, def_ratings, fetched_at = load_snapshot()
+injury_status, injury_source = load_injuries()
 team_ids = {t["full_name"]: t["id"] for t in sorted(nba_teams_static.get_teams(), key=lambda t: t["full_name"])}
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -57,8 +73,17 @@ with st.sidebar:
     team = st.selectbox("Team", list(team_ids), index=list(team_ids).index("Boston Celtics"))
     opponent = st.selectbox("Opponent", ["League average"] + [n for n in team_ids if n != team])
     roster_names = rosters.loc[rosters["TEAM_ID"] == team_ids[team], "PLAYER"].tolist()
-    injured = st.multiselect("Ruled out", roster_names)
-    st.caption(f"Data snapshot: {fetched_at}")
+    status = {n: s for n in roster_names if (s := injury_status.get(name_key(n)))}
+    injured = st.multiselect(
+        "Ruled out",
+        roster_names,
+        default=[n for n, s in status.items() if s == "Out"],
+        format_func=lambda n: f"{n} ({status[n]})" if n in status else n,
+        key=f"ruled_out_{team}",  # per team, so switching teams re-applies that team's report
+        help="Pre-filled with players the injury report lists as Out. Day-To-Day players are left in; "
+        "rule them out yourself if they won't play.",
+    )
+    st.caption(f"Data snapshot: {fetched_at}  \nInjury report: {injury_source}")
 
 opp_rating = LEAGUE_AVG_DEF_RATING
 if opponent != "League average":
@@ -85,16 +110,20 @@ c1.metric("Projected lineup score", f"{result['total_predicted_score']:.1f}")
 c2.metric("Opponent DEF rating", f"{opp_rating:.1f}")
 c3.metric("Active players", result["pool_size"])
 
-lineup = result["lineup"].assign(model=lambda d: d["name"].map(lambda n: scores[n]["model_used"]))
+lineup = result["lineup"].assign(
+    model=lambda d: d["name"].map(lambda n: scores[n]["model_used"]),
+    status=lambda d: d["name"].map(lambda n: status.get(n, "")),
+)
 st.subheader("Optimal lineup")
 st.dataframe(
-    lineup[["slot", "name", "position", "predicted_score", "avg_minutes", "model"]],
+    lineup[["slot", "name", "position", "status", "predicted_score", "avg_minutes", "model"]],
     hide_index=True,
     width="stretch",
     column_config={
         "slot": "Slot",
         "name": "Player",
         "position": "Pos",
+        "status": "Injury",
         "predicted_score": st.column_config.NumberColumn("Projected", format="%.1f"),
         "avg_minutes": st.column_config.NumberColumn("Avg min", format="%.1f"),
         "model": "Model",

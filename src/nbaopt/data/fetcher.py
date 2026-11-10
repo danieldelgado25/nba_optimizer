@@ -5,6 +5,7 @@ Pulls player stats from nba_api and the injury report from ESPN.
 
 import json
 import time
+import unicodedata
 import urllib.request
 
 import pandas as pd
@@ -113,6 +114,12 @@ def get_injury_report(timeout: float = 10) -> pd.DataFrame:
         for i in team.get("injuries", [])
     ]
     return pd.DataFrame(rows, columns=INJURY_COLUMNS).astype({"TEAM_ID": "Int64"})
+
+
+def name_key(name: str) -> str:
+    """Normalize a player name for matching across sources: 'Luka Dončić' == 'luka doncic'."""
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    return " ".join("".join(c for c in ascii_name.lower() if c.isalnum() or c.isspace()).split())
 
 
 def opponent_abbr(matchup: pd.Series) -> pd.Series:
