@@ -28,6 +28,10 @@ from nbaopt.data.fetcher import (
 )
 from nbaopt.models.injury_impact import batch_injury_report, compute_injury_impact
 from nbaopt.models.predictor import predict_player_score
+
+# Windows consoles default to cp1252, which crashes on names like "Dončić" and on the emoji output.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from nbaopt.optimizer.lineup import optimize_lineup
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
