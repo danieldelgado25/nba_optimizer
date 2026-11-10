@@ -100,3 +100,53 @@ def test_explicit_season_overrides_default(monkeypatch, fake):
     roster = fetcher.get_team_roster(1610612738, season="2019-20")
     assert list(roster.columns) == ["PLAYER_ID", "PLAYER", "NUM", "POSITION"]
     assert fake.calls[0]["season"] == "2019-20"
+
+
+def test_get_injury_report_parses_espn(monkeypatch):
+    import io
+    import json
+
+    payload = {
+        "injuries": [
+            {
+                "displayName": "LA Clippers",  # ESPN's name; nba_api says "Los Angeles Clippers"
+                "injuries": [
+                    {
+                        "athlete": {"displayName": "Bradley Beal"},
+                        "status": "Out",
+                        "shortComment": "Hip.",
+                        "date": "2026-11-01T00:00Z",
+                    }
+                ],
+            },
+            {
+                "displayName": "Minnesota Timberwolves",
+                "injuries": [{"athlete": {"displayName": "Anthony Edwards"}, "status": "Day-To-Day"}],
+            },
+        ]
+    }
+    monkeypatch.setattr(
+        fetcher.urllib.request, "urlopen", lambda req, timeout: io.BytesIO(json.dumps(payload).encode())
+    )
+
+    df = fetcher.get_injury_report()
+
+    assert df.to_dict("records") == [
+        {
+            "PLAYER": "Bradley Beal",
+            "TEAM_ID": 1610612746,
+            "STATUS": "Out",
+            "COMMENT": "Hip.",
+            "DATE": "2026-11-01T00:00Z",
+        },
+        {"PLAYER": "Anthony Edwards", "TEAM_ID": 1610612750, "STATUS": "Day-To-Day", "COMMENT": "", "DATE": ""},
+    ]
+
+
+def test_get_injury_report_empty(monkeypatch):
+    import io
+
+    monkeypatch.setattr(fetcher.urllib.request, "urlopen", lambda req, timeout: io.BytesIO(b"{}"))
+    df = fetcher.get_injury_report()
+    assert df.empty
+    assert list(df.columns) == fetcher.INJURY_COLUMNS
