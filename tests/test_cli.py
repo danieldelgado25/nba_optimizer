@@ -3,6 +3,7 @@ import pytest
 
 from conftest import make_game_log, make_roster
 from nbaopt import cli
+from nbaopt.data import fetcher
 
 ROSTER = make_roster(
     [
@@ -30,6 +31,11 @@ def offline(monkeypatch, no_model):
         "get_team_defensive_rating",
         lambda season=None: pd.DataFrame([{"TEAM_ID": 1610612744, "DEF_RATING": 110.0}]),
     )
+    captured: dict[str, list] = {"injuries": []}
+    monkeypatch.setattr(
+        cli, "get_injury_report", lambda: pd.DataFrame(captured["injuries"], columns=fetcher.INJURY_COLUMNS)
+    )
+    return captured
 
 
 def test_parser_subcommands():
@@ -77,3 +83,36 @@ def test_resolve_player():
     assert cli.resolve_player("jaylen brown", names) == "Jaylen Brown"
     assert cli.resolve_player("Tatum", names) == "Jayson Tatum"
     assert cli.resolve_player("Nobody", names) is None
+
+
+def injury(name, status):
+    return {"PLAYER": name, "TEAM_ID": 0, "STATUS": status, "COMMENT": "", "DATE": ""}
+
+
+def test_injury_report_marks_out_players(offline, capsys):
+    offline["injuries"] = [injury("Big One", "Out"), injury("Wing One", "Day-To-Day"), injury("Elsewhere", "Out")]
+    cli.main(["lineup", "--team", "BOS"])
+    out = capsys.readouterr().out
+    assert "Marked as OUT: Big One" in out
+    assert "Wing One — Day-To-Day (kept active" in out
+    assert "Elsewhere" not in out
+    assert "EXCLUDED (OUT/NO DATA): Big One" in out
+
+
+def test_injury_report_skipped_when_disabled_or_past_season(offline, capsys, monkeypatch):
+    monkeypatch.setenv("NBAOPT_SEASON", "2026-27")
+    offline["injuries"] = [injury("Big One", "Out")]
+    cli.main(["lineup", "--team", "BOS", "--no-injury-report"])
+    cli.main(["lineup", "--team", "BOS", "--season", "2024-25"])
+    assert "Marked as OUT" not in capsys.readouterr().out
+
+
+def test_injury_report_failure_is_not_fatal(offline, capsys, monkeypatch):
+    def boom():
+        raise OSError("blocked")
+
+    monkeypatch.setattr(cli, "get_injury_report", boom)
+    cli.main(["lineup", "--team", "BOS"])
+    out = capsys.readouterr().out
+    assert "Could not fetch the injury report" in out
+    assert "OPTIMAL LINEUP" in out
