@@ -1,9 +1,12 @@
 """
 fetcher.py
-Pulls player stats and injury data from nba_api.
+Pulls player stats from nba_api and the injury report from ESPN.
 """
 
+import json
 import time
+import unicodedata
+import urllib.request
 
 import pandas as pd
 from nba_api.stats.endpoints import (
@@ -81,6 +84,42 @@ def get_team_defensive_rating(season: str | None = None) -> pd.DataFrame:
     )
     df = stats.get_data_frames()[0]
     return df[["TEAM_ID", "TEAM_NAME", "DEF_RATING"]]
+
+
+# Unofficial, undocumented ESPN endpoint (no key). Callers must survive it failing.
+ESPN_INJURIES_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+INJURY_COLUMNS = ["PLAYER", "TEAM_ID", "STATUS", "COMMENT", "DATE"]
+
+
+def get_injury_report(timeout: float = 10) -> pd.DataFrame:
+    """
+    League-wide injury report: one row per listed player.
+
+    STATUS is ESPN's ("Out", "Day-To-Day", ...). PLAYER is ESPN's display name,
+    which can lack the accents nba_api uses ("Doncic" vs "Dončić").
+    """
+    req = urllib.request.Request(ESPN_INJURIES_URL, headers={"User-Agent": "nbaopt"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.load(resp)
+    rows = [
+        {
+            "PLAYER": i["athlete"]["displayName"],
+            # nickname, since ESPN says "LA Clippers" where nba_api says "Los Angeles Clippers"
+            "TEAM_ID": get_team_id(team["displayName"].split()[-1]),
+            "STATUS": i["status"],
+            "COMMENT": i.get("shortComment", ""),
+            "DATE": i.get("date", ""),
+        }
+        for team in data.get("injuries", [])
+        for i in team.get("injuries", [])
+    ]
+    return pd.DataFrame(rows, columns=INJURY_COLUMNS).astype({"TEAM_ID": "Int64"})
+
+
+def name_key(name: str) -> str:
+    """Normalize a player name for matching across sources: 'Luka Dončić' == 'luka doncic'."""
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+    return " ".join("".join(c for c in ascii_name.lower() if c.isalnum() or c.isspace()).split())
 
 
 def opponent_abbr(matchup: pd.Series) -> pd.Series:

@@ -55,6 +55,13 @@ reported. Bench players have zero impact. A star's impact is the gap between the
 and the best bench player who can replace them. Levels: 🔴 Critical (12%+),
 🟠 High (7%+), 🟡 Moderate (3%+), 🟢 Low.
 
+**6. Injury report.** Players ESPN's injury report lists as **Out** are ruled out
+automatically, in the app (pre-ticked, so you can override) and the CLI (current
+season only). **Day-To-Day** players stay active and are labeled, since game-time
+calls are yours. The app reads the report live (cached 1h) and falls back to the
+copy saved by `nbaopt snapshot`. The endpoint is unofficial, so if it is unreachable
+nothing is ruled out automatically.
+
 ## Architecture
 
 ```
@@ -105,7 +112,8 @@ streamlit run app.py            # web app (reads data/snapshot/)
 # Optimal lineup, adjusted for the opponent's defense
 nbaopt lineup --team "Celtics" --opponent "Knicks"
 
-# Mark players OUT (full names, or any part that matches exactly one player)
+# Mark players OUT (full names, or any part that matches exactly one player).
+# Players ESPN lists as Out are added automatically; --no-injury-report turns that off.
 nbaopt lineup --team "Celtics" --injured "Jayson Tatum, Jaylen Brown"
 
 # Impact of one player being ruled out, or of every player

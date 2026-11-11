@@ -21,18 +21,20 @@ import pandas as pd
 
 from nbaopt.config import current_season
 from nbaopt.data.fetcher import (
+    get_injury_report,
     get_player_game_log,
     get_team_defensive_rating,
     get_team_id,
     get_team_roster,
+    name_key,
 )
 from nbaopt.models.injury_impact import batch_injury_report, compute_injury_impact
 from nbaopt.models.predictor import predict_player_score
+from nbaopt.optimizer.lineup import optimize_lineup
 
 # Windows consoles default to cp1252, which crashes on names like "Dončić" and on the emoji output.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-from nbaopt.optimizer.lineup import optimize_lineup
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -158,6 +160,23 @@ def build_roster_scores(
     return roster_scores
 
 
+def apply_injury_report(roster_names: list[str], already_out: list[str]) -> list[str]:
+    """Print the roster's injury statuses and return the players listed Out (not already marked)."""
+    try:
+        report = get_injury_report()
+    except Exception as e:
+        print(f"  ⚠️  Could not fetch the injury report ({e}); only --injured players are marked OUT.")
+        return []
+    status = dict(zip(report["PLAYER"].map(name_key), report["STATUS"], strict=True))
+    listed = {n: s for n in roster_names if (s := status.get(name_key(n)))}
+    if not listed:
+        print("  🩹 Injury report: nobody listed")
+    for n, s in listed.items():
+        note = "marked OUT" if s == "Out" else "kept active, use --injured to rule out"
+        print(f"  🩹 Injury report: {n} — {s} ({note})")
+    return [n for n, s in listed.items() if s == "Out" and n not in already_out]
+
+
 def run(args):
     header("🏀 NBA LINEUP OPTIMIZER")
     season = args.season or current_season()
@@ -193,6 +212,8 @@ def run(args):
     roster_names = roster_df["PLAYER"].tolist()
     injured_names = [resolve_or_exit(q, roster_names) for q in args.injured.split(",")] if args.injured else []
     impact_name = resolve_or_exit(args.injury_impact, roster_names) if args.injury_impact else None
+    if args.injury_report and season == current_season():  # today's report says nothing about past seasons
+        injured_names += apply_injury_report(roster_names, injured_names)
     if injured_names:
         print(f"  ⛔ Marked as OUT: {', '.join(injured_names)}")
 
@@ -226,6 +247,7 @@ Examples:
   nbaopt lineup --team "Lakers" --opponent "Warriors" --injured "LeBron James"
   nbaopt lineup --team "Celtics" --injury-impact "Jayson Tatum"
   nbaopt lineup --team "Celtics" --impact-report
+  nbaopt lineup --team "Wolves" --no-injury-report   # ignore ESPN's Out list
 """
 
 
@@ -235,6 +257,12 @@ def add_lineup_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--team", required=True, help="Team name or abbreviation (e.g. 'Celtics', 'BOS')")
     parser.add_argument("--opponent", default=None, help="Opponent team (used for defensive rating adjustment)")
     parser.add_argument("--injured", default=None, help="Comma-separated list of injured/out players")
+    parser.add_argument(
+        "--no-injury-report",
+        action="store_false",
+        dest="injury_report",
+        help="Don't mark players the ESPN injury report lists as Out (current season only)",
+    )
     parser.add_argument(
         "--injury-impact",
         default=None,

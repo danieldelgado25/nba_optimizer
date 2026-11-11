@@ -16,7 +16,12 @@ import pandas as pd
 from nba_api.stats.static import teams as nba_teams_static
 
 from nbaopt.config import current_season, snapshot_dir
-from nbaopt.data.fetcher import get_player_game_log, get_team_defensive_rating, get_team_roster
+from nbaopt.data.fetcher import (
+    get_injury_report,
+    get_player_game_log,
+    get_team_defensive_rating,
+    get_team_roster,
+)
 from nbaopt.models.predictor import SEQ_LEN
 
 
@@ -26,6 +31,7 @@ def main() -> None:
     print(f"Snapshotting {current_season()}...")
 
     get_team_defensive_rating().to_csv(out / "def_ratings.csv", index=False)
+    get_injury_report().to_csv(out / "injuries.csv", index=False)  # fallback when the app can't reach ESPN
 
     rosters, logs = [], []
     for t_i, team in enumerate(nba_teams_static.get_teams(), 1):
